@@ -1,6 +1,7 @@
 //! 库入口：模块声明 + C ABI 导出（供 Python ctypes / 其它语言调用 DLL）。
 
 pub mod env;
+pub mod fingerprint;
 pub mod flow;
 pub mod mint;
 pub mod so;

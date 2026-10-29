@@ -141,6 +141,50 @@ pub fn tz_table(name: &str) -> Option<TzInfo> {
             zh: "太平洋标准时间",
             offset: -480,
         },
+        // 下面这批是设备指纹区域表（`fingerprint::REGIONS`）用到的时区：
+        // 缺了它们，`Profile::new` 会把偏移退成默认 +540，时区名和偏移就自相矛盾。
+        "Europe/London" => TzInfo {
+            en: "Greenwich Mean Time",
+            ja: "グリニッジ標準時",
+            zh: "格林尼治标准时间",
+            offset: 0,
+        },
+        "Europe/Berlin" => TzInfo {
+            en: "Central European Time",
+            ja: "中央ヨーロッパ時間",
+            zh: "中欧时间",
+            offset: 60,
+        },
+        "Europe/Paris" => TzInfo {
+            en: "Central European Time",
+            ja: "中央ヨーロッパ時間",
+            zh: "中欧时间",
+            offset: 60,
+        },
+        "Europe/Amsterdam" => TzInfo {
+            en: "Central European Time",
+            ja: "中央ヨーロッパ時間",
+            zh: "中欧时间",
+            offset: 60,
+        },
+        "Australia/Sydney" => TzInfo {
+            en: "Australian Eastern Standard Time",
+            ja: "オーストラリア東部標準時",
+            zh: "澳大利亚东部标准时间",
+            offset: 600,
+        },
+        "Asia/Seoul" => TzInfo {
+            en: "Korea Standard Time",
+            ja: "韓国標準時",
+            zh: "韩国标准时间",
+            offset: 540,
+        },
+        "America/Toronto" => TzInfo {
+            en: "Eastern Standard Time",
+            ja: "東部標準時",
+            zh: "东部标准时间",
+            offset: -300,
+        },
         _ => return None,
     };
     Some(info)

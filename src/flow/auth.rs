@@ -11,6 +11,7 @@
 
 use super::http::{RequestSpec, DEFAULT_TIMEOUT_SECS};
 use super::SentinelToken;
+use crate::fingerprint::DeviceFingerprint;
 use anyhow::{bail, Context, Result};
 use rand::Rng;
 use serde::Deserialize;
@@ -98,14 +99,21 @@ pub struct ClientHints {
 }
 
 impl ClientHints {
-    /// 从 UA 推 CH；非 Chromium 家族 / 非 Windows 返回 `None`。
+    /// 从 UA 推 CH（**只在显式指定 UA、没有设备指纹时**用）。
+    ///
+    /// 非 Chromium 家族 / 非 Windows 或 macOS 返回 `None`。平台必须从 UA 里认出来：
+    /// 早期实现只认 `Windows NT`，macOS 的 Chrome UA 会一个 CH 头都不发——比发错更假。
     pub fn from_user_agent(user_agent: &str) -> Option<Self> {
         if !user_agent.contains("Chrome/") || user_agent.contains("Firefox/") {
             return None;
         }
-        if !user_agent.contains("Windows NT") {
+        let platform = if user_agent.contains("Windows NT") {
+            "\"Windows\""
+        } else if user_agent.contains("Macintosh") || user_agent.contains("Mac OS X") {
+            "\"macOS\""
+        } else {
             return None;
-        }
+        };
         let marker = "Chrome/";
         let start = user_agent.find(marker)? + marker.len();
         let major: String = user_agent[start..]
@@ -121,8 +129,17 @@ impl ClientHints {
                  \"Google Chrome\";v=\"{major}\""
             ),
             sec_ch_ua_mobile: "?0".to_string(),
-            sec_ch_ua_platform: "\"Windows\"".to_string(),
+            sec_ch_ua_platform: platform.to_string(),
         })
+    }
+
+    /// 直接用设备指纹里的三元组（版本 / 平台与 UA 同源，不会对不上）。
+    pub fn from_fingerprint(fp: &DeviceFingerprint) -> Self {
+        Self {
+            sec_ch_ua: fp.sec_ch_ua.clone(),
+            sec_ch_ua_mobile: fp.sec_ch_ua_mobile.clone(),
+            sec_ch_ua_platform: fp.sec_ch_ua_platform.clone(),
+        }
     }
 
     /// 写进请求头的三元组（顺序对齐 Python：ua / mobile / platform）。
@@ -208,6 +225,17 @@ impl AuthRequestBuilder {
             hints: ClientHints::from_user_agent(user_agent),
             auth_session_logging_id: new_uuid(),
         }
+    }
+
+    /// 用设备指纹覆盖 UA / 语言 / client hints（三者同源，永远一致）。
+    ///
+    /// 没有指纹（显式指定 UA 的旧路径）时调用方不该调这个方法，构造器里的
+    /// [`ClientHints::from_user_agent`] 已经能从 UA 推出对应平台。
+    pub fn with_fingerprint(mut self, fp: &DeviceFingerprint) -> Self {
+        self.user_agent = fp.user_agent.clone();
+        self.accept_language = fp.languages.clone();
+        self.hints = Some(ClientHints::from_fingerprint(fp));
+        self
     }
 
     pub fn user_agent(&self) -> &str {

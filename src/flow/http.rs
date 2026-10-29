@@ -393,9 +393,25 @@ pub struct Client {
 
 impl Client {
     /// 只构造，不发请求 —— 可以在离线环境调用。
+    ///
+    /// emulation 取 `TURB_WREQ_EMULATION` 或默认 [`DEFAULT_EMULATION`]；要按设备指纹
+    /// 切档位用 [`Client::build_with_emulation`]。
     pub fn build(user_agent: &str, proxy: Option<&str>, policy: RetryPolicy) -> Result<Self> {
+        Self::build_with_emulation(user_agent, proxy, policy, None)
+    }
+
+    /// 指定 emulation 的构造入口（`None` = 走环境变量 / 默认档）。
+    ///
+    /// 设备指纹路径用这个把 TLS/HTTP2 档位和 UA 的 Chrome 版本对齐
+    /// （UA 说 145、握手按 149 就是一眼假的组合）。
+    pub fn build_with_emulation(
+        user_agent: &str,
+        proxy: Option<&str>,
+        policy: RetryPolicy,
+        emulation: Option<Profile>,
+    ) -> Result<Self> {
         let jar = Arc::new(Jar::default());
-        let emulation = emulation_from_env();
+        let emulation = emulation.unwrap_or_else(emulation_from_env);
 
         let mut builder = wreq::Client::builder()
             // Chrome TLS(JA3/JA4) + HTTP/2 (SETTINGS/窗口/伪头顺序) + 默认头。

@@ -18,6 +18,7 @@ OpenAI 注册链路中 **Sentinel token** 的 Rust 重实现，加上一套可�
 | `src/vm.rs` | 寄存器表 + 36 个 handler + 执行循环 + 内建函数派发 |
 | `src/env.rs` | 伪 window / document / navigator / screen / performance / storage / DOM |
 | `src/token.rs` | Profile、config 25 字段、FNV-1a PoW、requirements / enforcement token |
+| `src/fingerprint.rs` | 设备指纹生成器：UA / client hints / 屏幕 / 时区 / 语言 / 硬件，一次注册一套 |
 | `src/mint.rs` | 组合入口：challenge + p + profile → `t` / `so` |
 | `src/flow/` | 注册流程：HTTP、授权、邮箱取码、OTP、TOTP、SQLite |
 | `src/ffi.rs` | C ABI（`cdylib`），给 Python ctypes / C# / Go 调用 |
@@ -87,7 +88,9 @@ $env:TURB_WREQ_EMULATION = "Chrome146"
 | `SENTINEL_ENABLE_2FA` | 注册后 enroll + activate TOTP | `0` |
 | `OTP_MAX_WAIT` / `OTP_POLL_INTERVAL` | 取码等待上限 / 轮询间隔（秒） | `180` / `3` |
 | `SENTINEL_DB_PATH` | SQLite 路径 | `data/sentinel-rs.db` |
-| `SENTINEL_USER_AGENT` / `SENTINEL_ACCEPT_LANGUAGE` | 指纹相关 | 内置 Chrome UA / `en-US,en;q=0.9` |
+| `SENTINEL_USER_AGENT` / `SENTINEL_ACCEPT_LANGUAGE` | 显式指定 UA / 语言；**给定时不做随机指纹** | 每次注册随机生成（见下节） |
+| `SENTINEL_FP_SEED` | 设备指纹随机种子；给定则确定性生成 | 空 → 系统随机 |
+| `SENTINEL_FP_COUNTRY` | 强制指纹区域（`JP` / `GB` / `DE` …） | 空 → 全表随机 |
 | `SENTINEL_LOG` | `trace` / `debug` / `info` / `warn` / `error` / `off` | `info` |
 
 ### 代理
@@ -112,6 +115,48 @@ $env:REG_MAIL_API_TOKEN="<你的 token，可留空>"
 $env:OTP_MAX_WAIT="120"; $env:OTP_POLL_INTERVAL="3"
 .\target\release\sentinel-rs.exe register -n 1 --live --proxy "socks5h://127.0.0.1:1080"
 ```
+
+## 设备指纹
+
+每次注册都会**现场抽一套随机但自洽**的浏览器画像（`src/fingerprint.rs`），不再用写死的
+`Chrome/145` + `"Windows"`。一次注册里，下面这些值全部由同一份
+`DeviceFingerprint` 派生，所以 HTTP 头、sentinel token 里的 `profile` 块、
+TLS/HTTP2 emulation 三处永远一致：
+
+| 维度 | 规则 |
+| --- | --- |
+| 浏览器版本 | 只从 `145.0.0.0` / `146.0.0.0` / `149.0.0.0` 里选，且 `emulation` 必须是同档位（`Chrome145/146/149`）；UA 与 `sec-ch-ua` 的版本号必须一致 |
+| 平台 | 二选一：Windows（`Windows NT 10.0; Win64; x64` / `"Windows"` / `Win32`）或 macOS（`Macintosh; Intel Mac OS X 10_15_7` / `"macOS"` / `MacIntel`） |
+| 时区 ↔ 语言 | 只从同一行区域画像里取，绝不交叉组合（`Asia/Tokyo→ja-JP`、`Asia/Shanghai→zh-CN`、`America/New_York→en-US`、`Europe/London→en-GB`、`Europe/Berlin→de-DE`、`Asia/Singapore→en-SG`、`Australia/Sydney→en-AU` …） |
+| 屏幕 / dpr | 平台各自的常见组合（`1366x768` … `3840x2160`），`screen_height >= 700`，dpr ∈ {1.0, 1.25, 1.5, 2.0} 且与屏幕匹配 |
+| 硬件 | `hardware_concurrency ∈ {4,8,12,16}`、`device_memory ∈ {4,8,16}` |
+| fingerprint_id | `fp_` + 16 位 base62，完全本地派生，不依赖任何外部指纹服务 |
+
+`accept-language` 由主语言派生：`ja-JP` → `ja-JP,ja;q=0.9,en;q=0.8`，英语系则是
+`en-US,en;q=0.9`。
+
+### 三个环境变量
+
+| 变量 | 作用 |
+| --- | --- |
+| `SENTINEL_FP_SEED` | 给定则**确定性生成**：同 seed 得到完全相同的一套指纹（含 `fingerprint_id`），方便复现线上画像 / 回归测试 |
+| `SENTINEL_FP_COUNTRY` | 强制区域，如 `JP`（大小写不敏感）。时区、语言、屏幕倾向都跟着该区域走；未知国家回退到全量随机 |
+| `SENTINEL_USER_AGENT` / `SENTINEL_ACCEPT_LANGUAGE` | 显式覆盖：**此时完全不随机**，UA / 语言按你给的值走（旧行为）；`SENTINEL_ACCEPT_LANGUAGE` 单独设置同样会关掉随机 |
+
+```powershell
+# 同 seed 可复现：连跑两次，指纹（含 fp= 后面的 id）完全一样
+$env:SENTINEL_FP_SEED="demo-seed"; .\target\release\sentinel-rs.exe register -n 1
+$env:SENTINEL_FP_SEED="demo-seed"; .\target\release\sentinel-rs.exe register -n 1
+
+# 强制日本画像 + 随机 seed：每次都是 Asia/Tokyo / ja-JP，但屏幕/硬件/版本会变
+Remove-Item Env:SENTINEL_FP_SEED
+$env:SENTINEL_FP_COUNTRY="JP"; .\target\release\sentinel-rs.exe register -n 1
+```
+
+`register` 的配置打印里有一行「指纹」，格式是
+`<版本> / <平台> / <时区> / <屏幕>/<dpr> / fp=<id>`；真实注册时日志还会打出
+`[fp] … ua=<本次实际使用的 UA>`，可以直接对照。多账号（`-n > 1`）**每个账号各生成一套**，
+配置打印那一行显示的是"每账号独立生成"。
 
 ## 邮箱 API 契约
 

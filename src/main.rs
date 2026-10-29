@@ -317,6 +317,12 @@ fn cmd_register(argv: &[String]) -> Result<()> {
 
     init_tracing();
 
+    // 单账号：先把本次要用的设备指纹定下来，配置里打印的就是这次真正使用的那一套。
+    // 多账号（-n > 1）留给 register_once 逐账号生成，避免 N 个号共用一张画像。
+    if cfg.fingerprint.is_none() && cfg.count == 1 {
+        cfg.fingerprint = cfg.resolve_fingerprint();
+    }
+
     println!("== 注册配置 ==");
     println!("  模式      : {}", if cfg.dry_run { "dry-run（不联网）" } else { "LIVE（真实联网注册）" });
     println!("  数量      : {}", cfg.count);
@@ -331,6 +337,7 @@ fn cmd_register(argv: &[String]) -> Result<()> {
     println!("  2FA       : {}", if cfg.enable_2fa { "enroll+activate" } else { "关闭" });
     println!("  数据库    : {}", cfg.db_path.display());
     println!("  取码超时  : {}s（间隔 {}s）", cfg.otp_max_wait_secs, cfg.otp_poll_interval_secs);
+    println!("  指纹      : {}", fingerprint_line(&cfg));
 
     cfg.require_live_prerequisites()?;
 
@@ -436,6 +443,20 @@ fn cmd_register(argv: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// 配置打印里的「指纹」一行：`<版本> / <平台> / <时区> / <屏幕>/<dpr> / fp=<id>`。
+///
+/// 多账号 / 显式覆盖时不打印具体值（那种情况下每个账号各有一套或干脆固定）。
+fn fingerprint_line(cfg: &RegisterConfig) -> String {
+    match &cfg.fingerprint {
+        Some(fp) => fp.summary(),
+        None if cfg.count > 1 => format!(
+            "每个账号独立生成（共 {} 套，可用 SENTINEL_FP_SEED 固定）",
+            cfg.count
+        ),
+        None => "固定（SENTINEL_USER_AGENT / SENTINEL_ACCEPT_LANGUAGE 显式覆盖）".to_string(),
+    }
+}
+
 fn init_tracing() {
     let level = match std::env::var("SENTINEL_LOG")
         .unwrap_or_else(|_| "info".to_string())
@@ -500,6 +521,9 @@ register 选项:
   SENTINEL_ENABLE_2FA                        1/true 开启 2FA
   OTP_MAX_WAIT / OTP_POLL_INTERVAL           取码超时 / 轮询间隔（秒）
   SENTINEL_LIVE_REGISTER                     1 才允许真实联网注册
+  SENTINEL_USER_AGENT / SENTINEL_ACCEPT_LANGUAGE  显式指定 UA / 语言（给定时不做随机指纹）
+  SENTINEL_FP_SEED                           设备指纹 seed（同 seed 可复现整套指纹）
+  SENTINEL_FP_COUNTRY                        强制指纹区域（JP / GB / DE …）
   SENTINEL_LOG                               trace/debug/info/warn/error/off
 
 示例:

@@ -34,6 +34,7 @@ use tracing::{debug, info, warn};
 
 use super::http;
 use super::{SentinelToken, SentinelTokenSource};
+use crate::fingerprint::DeviceFingerprint;
 use crate::mint;
 use crate::token::{
     enforcement_token, json_string, requirements_token, Profile, ProfileOptions, Rng, TokenCtx,
@@ -641,7 +642,23 @@ impl SentinelTokenSource for ClosureSource {
 
 // ─────────────────────────── profile / 工厂 ───────────────────────────
 
-/// 用 UA + `accept-language` 造一个 profile（注册链的真实指纹由配置驱动）。
+/// 用**设备指纹**造 profile：token 里的 `profile` 块与 HTTP 头完全同源。
+///
+/// UA / 屏幕 / 语言 / 平台 / vendor / 硬件 / dpr / 时区 全部取
+/// [`DeviceFingerprint::profile_options`]，不存在"头说 Windows、token 说 MacIntel"
+/// 这种自相矛盾。
+pub fn profile_from_fp(fp: &DeviceFingerprint) -> Profile {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64() * 1000.0)
+        .unwrap_or(0.0);
+    Profile::new(&fp.profile_options(), now_ms, &mut Rng::system())
+}
+
+/// 显式 UA / 语言覆盖（无指纹）时的兜底：只从 UA + `accept-language` 推 profile。
+///
+/// 其余字段走 [`ProfileOptions::default`]（Python 侧同样如此），所以随机指纹路径
+/// 一律用 [`profile_from_fp`]，不要走这里。
 pub fn profile_for(user_agent: &str, accept_language: &str) -> Profile {
     let language = accept_language
         .split(',')
@@ -676,16 +693,29 @@ pub fn profile_for(user_agent: &str, accept_language: &str) -> Profile {
 ///
 /// sentinel 端点不依赖 auth cookie，所以与注册链的 client 分开是安全的；
 /// 这样 [`SentinelTokenSource::token`] 保持同步签名，编排层不用改。
+///
+/// `fp = Some(..)` 时：profile 走 [`profile_from_fp`]，TLS/HTTP2 emulation 也切到
+/// 指纹对应的 Chrome 档位（与 UA 的版本号一致）；`None` 时保持旧行为。
 pub fn live_source(
     user_agent: &str,
     accept_language: &str,
     proxy: Option<&str>,
+    fp: Option<&DeviceFingerprint>,
 ) -> Result<SentinelSource> {
+    let emulation = fp.and_then(|fp| http::parse_emulation(&fp.emulation));
     let client = Arc::new(
-        http::Client::build(user_agent, proxy, http::RetryPolicy::default())
-            .context("构建 sentinel HTTP client 失败")?,
+        http::Client::build_with_emulation(
+            user_agent,
+            proxy,
+            http::RetryPolicy::default(),
+            emulation,
+        )
+        .context("构建 sentinel HTTP client 失败")?,
     );
-    let profile = profile_for(user_agent, accept_language);
+    let profile = match fp {
+        Some(fp) => profile_from_fp(fp),
+        None => profile_for(user_agent, accept_language),
+    };
     let transport = Arc::new(HttpTransport::new(client, accept_language.to_string()));
     Ok(SentinelSource::new(profile, transport).with_accept_language(accept_language.to_string()))
 }

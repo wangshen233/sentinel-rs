@@ -43,12 +43,18 @@ use anyhow::{bail, Context, Result};
 use std::path::PathBuf;
 use tracing::{debug, info, warn};
 
+use crate::fingerprint;
+
 /// 环境变量前缀：`SENTINEL_*`。
 pub const ENV_PREFIX: &str = "SENTINEL_";
 
+/// 内置 UA：只在**显式覆盖指纹**（未启用随机指纹）时使用。
 pub const DEFAULT_USER_AGENT: &str =
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) \
      Chrome/145.0.0.0 Safari/537.36";
+
+/// 内置 `accept-language`：与 [`DEFAULT_USER_AGENT`] 配套，同上。
+pub const DEFAULT_ACCEPT_LANGUAGE: &str = "en-US,en;q=0.9";
 
 // ─────────────────────────── 配置 ───────────────────────────
 
@@ -66,6 +72,14 @@ pub const DEFAULT_USER_AGENT: &str =
 /// | `OTP_MAX_WAIT` / `OTP_POLL_INTERVAL` | 取码等待上限 / 轮询间隔（秒） | `180` / `3` |
 /// | `SENTINEL_LIVE_REGISTER` | `1` 才真的联网注册 | `0`（dry-run） |
 /// | `SENTINEL_USER_AGENT` / `SENTINEL_ACCEPT_LANGUAGE` | 指纹相关 | 内置 Chrome UA / `en-US,en;q=0.9` |
+/// | `SENTINEL_FP_SEED` | 设备指纹随机种子（给定则同 seed 可复现） | 空 → 系统随机 |
+/// | `SENTINEL_FP_COUNTRY` | 强制区域（`JP` / `GB` / `DE` …，见 [`fingerprint::REGIONS`]） | 空 → 全表随机 |
+///
+/// ### 设备指纹
+///
+/// 默认**每次注册现抽一套**自洽指纹（UA / client hints / 屏幕 / 时区 / 语言 / 硬件），
+/// 见 [`fingerprint::DeviceFingerprint`]。一旦显式设置 `SENTINEL_USER_AGENT` 或
+/// `SENTINEL_ACCEPT_LANGUAGE`，就**不再随机**（保持调用方给的那一套，旧行为）。
 #[derive(Debug, Clone)]
 pub struct RegisterConfig {
     pub proxy: Option<String>,
@@ -77,6 +91,9 @@ pub struct RegisterConfig {
     pub otp_poll_interval_secs: u64,
     pub user_agent: String,
     pub accept_language: String,
+    /// 本次注册的设备指纹。`None` = 到 [`register_once`] 时按环境现生成（每账号一套）；
+    /// `Some` = 调用方指定（CLI 打印/复现时也会预先写进来，保证"打印的 == 实际用的"）。
+    pub fingerprint: Option<fingerprint::DeviceFingerprint>,
     pub dry_run: bool,
     /// 只跑 warmup → signin → authorize init（不领邮箱、不注册），验证会话建立。
     pub preflight: bool,
@@ -93,7 +110,8 @@ impl Default for RegisterConfig {
             otp_max_wait_secs: 180,
             otp_poll_interval_secs: 3,
             user_agent: DEFAULT_USER_AGENT.to_string(),
-            accept_language: "en-US,en;q=0.9".to_string(),
+            accept_language: DEFAULT_ACCEPT_LANGUAGE.to_string(),
+            fingerprint: None,
             dry_run: true,
             preflight: false,
         }
@@ -168,10 +186,74 @@ impl RegisterConfig {
             user_agent: get("SENTINEL_USER_AGENT")
                 .unwrap_or_else(|| DEFAULT_USER_AGENT.to_string()),
             accept_language: get("SENTINEL_ACCEPT_LANGUAGE")
-                .unwrap_or_else(|| "en-US,en;q=0.9".to_string()),
+                .unwrap_or_else(|| DEFAULT_ACCEPT_LANGUAGE.to_string()),
+            // 指纹默认推迟到 register_once 里按账号生成（`SENTINEL_FP_SEED` /
+            // `SENTINEL_FP_COUNTRY` 在生成时读取）；显式 UA / 语言覆盖时不生成。
+            fingerprint: None,
             dry_run,
             preflight: false,
         })
+    }
+
+    /// 调用方是否显式指定了 UA / 语言（此时**不做随机指纹**，保持旧行为）。
+    ///
+    /// 同时看两处：进程环境变量（`SENTINEL_USER_AGENT` / `SENTINEL_ACCEPT_LANGUAGE`）
+    /// 和配置里的值本身（FFI 走 JSON 配置，不走进程环境）。配置里的值和内置默认
+    /// 一样就视为"没覆盖"。
+    pub fn has_ua_override(&self) -> bool {
+        let env_set = |key: &str| {
+            std::env::var(key)
+                .ok()
+                .map(|v| !v.trim().is_empty())
+                .unwrap_or(false)
+        };
+        env_set("SENTINEL_USER_AGENT")
+            || env_set("SENTINEL_ACCEPT_LANGUAGE")
+            || self.user_agent.trim() != DEFAULT_USER_AGENT.trim()
+            || self.accept_language.trim() != DEFAULT_ACCEPT_LANGUAGE
+    }
+
+    /// 本次注册要用的设备指纹：显式注入了就用它，否则按环境现生成一套。
+    ///
+    /// 返回 `None` 表示"不随机"（显式 UA / 语言覆盖）。
+    pub fn resolve_fingerprint(&self) -> Option<fingerprint::DeviceFingerprint> {
+        if let Some(fp) = &self.fingerprint {
+            return Some(fp.clone());
+        }
+        if self.has_ua_override() {
+            return None;
+        }
+        Some(fingerprint::generate_from_env())
+    }
+
+    /// 把指纹投影到 UA / `accept-language`（token profile 与 HTTP 头共用同一份）。
+    pub fn with_fingerprint(mut self) -> Self {
+        if let Some(fp) = self.resolve_fingerprint() {
+            self.user_agent = fp.user_agent.clone();
+            self.accept_language = fp.languages.clone();
+            self.fingerprint = Some(fp);
+        }
+        self
+    }
+
+    /// 指纹对应的 wreq TLS/HTTP2 emulation 档位；无指纹时返回 `None`（走 `http` 默认）。
+    pub fn emulation_profile(&self) -> Option<wreq_util::Profile> {
+        self.fingerprint
+            .as_ref()
+            .and_then(|fp| http::parse_emulation(&fp.emulation))
+    }
+
+    /// 按配置造 auth 请求构造器（有指纹就把 client hints 一并对齐）。
+    fn auth_builder(&self, device_id: &str) -> auth::AuthRequestBuilder {
+        let builder = auth::AuthRequestBuilder::new(
+            &self.user_agent,
+            &self.accept_language,
+            device_id,
+        );
+        match &self.fingerprint {
+            Some(fp) => builder.with_fingerprint(fp),
+            None => builder,
+        }
     }
 
     /// 真实链路必须有的东西；dry-run 不做强制（沙箱里也能跑 `register -n 1`）。
@@ -280,13 +362,31 @@ impl RegisterIdentity {
 ///
 /// 真实模式（`SENTINEL_LIVE_REGISTER=1`）用 [`sentinel::live_source`] 造真实 token 源；
 /// dry-run 用 [`MissingSentinelSource`]——它一被调用就报错，而 dry-run 根本不会调它。
+///
+/// 进来第一件事是**定下本次的设备指纹**：UA / `accept-language` / client hints /
+/// token profile / TLS emulation 全部由这一份派生，保证一个账号一套且完全自洽。
 pub async fn register_once(cfg: &RegisterConfig) -> Result<RegistrationOutcome> {
+    let cfg = cfg.clone().with_fingerprint();
+    log_fingerprint(&cfg);
     if cfg.dry_run {
-        return register_once_with(cfg, &MissingSentinelSource).await;
+        return register_once_with(&cfg, &MissingSentinelSource).await;
     }
-    let source = sentinel::live_source(&cfg.user_agent, &cfg.accept_language, cfg.proxy.as_deref())
-        .context("初始化 sentinel token 源失败")?;
-    register_once_with(cfg, &source).await
+    let source = sentinel::live_source(
+        &cfg.user_agent,
+        &cfg.accept_language,
+        cfg.proxy.as_deref(),
+        cfg.fingerprint.as_ref(),
+    )
+    .context("初始化 sentinel token 源失败")?;
+    register_once_with(&cfg, &source).await
+}
+
+/// 打一行本次实际使用的设备画像（`SENTINEL_LOG=info` 默认可见）。
+fn log_fingerprint(cfg: &RegisterConfig) {
+    match &cfg.fingerprint {
+        Some(fp) => info!("[fp] {} ua={}", fp.summary(), fp.user_agent),
+        None => info!("[fp] 固定指纹（显式 UA / 语言覆盖）: ua={}", cfg.user_agent),
+    }
 }
 
 /// 可注入 sentinel token 源的版本（便于接 mint，也便于测试）。
@@ -324,15 +424,17 @@ pub async fn register_once_with(
 /// 存在的意义：链路上任何一步坏掉都会在下游 `user/register` 变成
 /// 409 invalid_state，而那时邮箱已经花掉了 —— 先在这里用 0 成本把状态摸清。
 pub async fn preflight_authorize(cfg: &RegisterConfig) -> Result<Vec<String>> {
-    use auth::AuthRequestBuilder;
+    let cfg = cfg.clone().with_fingerprint();
+    log_fingerprint(&cfg);
 
-    let http = http::Client::build(
+    let http = http::Client::build_with_emulation(
         &cfg.user_agent,
         cfg.proxy.as_deref(),
         http::RetryPolicy::default(),
+        cfg.emulation_profile(),
     )?;
 
-    let probe = AuthRequestBuilder::new(&cfg.user_agent, &cfg.accept_language, "");
+    let probe = cfg.auth_builder("");
     let warm = authorize::warmup(&http, &probe).await?;
 
     let tag: String = uuid::Uuid::new_v4()
@@ -342,7 +444,7 @@ pub async fn preflight_authorize(cfg: &RegisterConfig) -> Result<Vec<String>> {
         .take(8)
         .collect();
     let email = format!("preflight+{tag}@example.com");
-    let builder = AuthRequestBuilder::new(&cfg.user_agent, &cfg.accept_language, &warm.device_id);
+    let builder = cfg.auth_builder(&warm.device_id);
 
     let auth_url = authorize::fetch_authorize_url(
         &http,
@@ -376,7 +478,7 @@ async fn live_register(
     cfg: &RegisterConfig,
     sentinel: &dyn SentinelTokenSource,
 ) -> Result<RegistrationOutcome> {
-    use auth::{AuthRequestBuilder, Intent};
+    use auth::Intent;
 
     cfg.require_live_prerequisites()?;
     let email_api = cfg
@@ -384,10 +486,11 @@ async fn live_register(
         .as_ref()
         .context("缺少邮箱 API 配置（REG_MAIL_API_BASE_URL）")?;
 
-    let http = http::Client::build(
+    let http = http::Client::build_with_emulation(
         &cfg.user_agent,
         cfg.proxy.as_deref(),
         http::RetryPolicy::default(),
+        cfg.emulation_profile(),
     )?;
     let mail = email::MailApiClient::new(&http, email_api.clone());
 
@@ -395,7 +498,7 @@ async fn live_register(
     //    Python run_register 的第一件事，且必须在领邮箱之前拦掉：没有 oai-did 的会话
     //    在 signin 阶段拿不到 auth.openai.com 的 authorize URL，后续必 409，别为注定
     //    失败的轮次浪费一个邮箱。
-    let probe = AuthRequestBuilder::new(&cfg.user_agent, &cfg.accept_language, "");
+    let probe = cfg.auth_builder("");
     let warm = authorize::warmup(&http, &probe).await?;
 
     // 1) 建/领邮箱
@@ -407,8 +510,7 @@ async fn live_register(
     // oai-did 必须用 warmup 种下的那个（Python `_resolve_device_id`：cookie 优先，
     // 凭空 uuid4 服务端不认这个会话 —— 那正是 409 invalid_state 的上游根因）
     identity.device_id = warm.device_id.clone();
-    let builder =
-        AuthRequestBuilder::new(&cfg.user_agent, &cfg.accept_language, &identity.device_id);
+    let builder = cfg.auth_builder(&identity.device_id);
 
     // 2) signin → authorize URL。邮箱靠 login_hint 透传进去；
     //    Python 当前**不再 POST authorize/continue**（那个 POST 0 次调用）。
@@ -923,10 +1025,8 @@ fn sentinel_steps(flow: &str, device_id: &str, accept_language: &str) -> Vec<Pla
 
 /// 构造 dry-run 的**完整**计划（含 sentinel 本地步骤，纯函数，不发请求）。
 pub fn build_plan_steps(cfg: &RegisterConfig, identity: &RegisterIdentity) -> Vec<PlanStep> {
-    use auth::AuthRequestBuilder;
-
-    let builder =
-        AuthRequestBuilder::new(&cfg.user_agent, &cfg.accept_language, &identity.device_id);
+    // 指纹若已在配置里（register_once / main 预先生成），计划里的头就跟着指纹走。
+    let builder = cfg.auth_builder(&identity.device_id);
     let st = SentinelToken {
         token: "<sentinel-token>".to_string(),
         so_token: Some("<sentinel-so-token>".to_string()),
