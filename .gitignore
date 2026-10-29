@@ -1,0 +1,8 @@
+/target
+/data
+__pycache__/
+*.db
+*.pyc
+
+# 构建产物（dist 里放的是本地编译的 exe，不进版本库）
+/dist

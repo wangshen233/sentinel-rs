@@ -1,0 +1,44 @@
+[package]
+name = "sentinel-rs"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "sentinel_rs"
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "sentinel-rs"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
+rand = "0.8"
+
+# ── 注册流程骨架（src/flow/**）──────────────────────────────────────────
+# 传输层：wreq（BoringSSL / btls）—— 真 Chrome TLS(JA3/JA4) + HTTP/2 指纹。
+# 版本必须钉死：wreq 6.0.0-rc 编译报 TcpConnector 缺失，wreq-util 3.0.0-rc 会拉
+# wreq 6，两者都不能用。0.16.1 + wreq-util 0.2.0 是已验证可编译可跑的组合。
+# 构建必须走仓库根的 build.ps1（BoringSSL 需要 MSVC + nasm + perl + libclang）。
+wreq = { version = "=0.16.1", features = ["cookies", "gzip", "brotli", "deflate", "socks"] }
+wreq-util = "=0.2.0"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+uuid = { version = "1", features = ["v4"] }
+hmac = "0.12"
+sha1 = "0.10"
+base32 = "0.5"
+rusqlite = { version = "0.32", features = ["bundled"] }
+anyhow = "1"
+tracing = "0.1"
+# CLI 侧日志输出（没有 subscriber 时 tracing 是空操作）
+tracing-subscriber = "0.3"
+dotenvy = "0.15"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+# 刻意保留 panic = "unwind"：ffi 层用 catch_unwind 兜底，
+# 改成 abort 会让内部 panic 直接杀掉调用方进程（DLL 是交给别人用的，不能这样）。
