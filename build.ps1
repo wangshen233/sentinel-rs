@@ -44,6 +44,52 @@ $VcVars    = 'C:\Program Files\Microsoft Visual Studio\2022\Professional\VC\Auxi
 $LlvmDir   = 'C:\Program Files\LLVM\bin'
 $LibClang  = Join-Path $LlvmDir 'libclang.dll'
 
+# ── 0) 非 ASCII 路径兜底（BoringSSL 的 nasm 打不开中文目录）──────────────
+# btls-sys 用 nasm 汇编 BoringSSL 的 .asm；nasm 按 ANSI 打开路径，项目目录里
+# 只要有中文（例如桌面的「新建文件夹 (4)」），cmake 的 asm 步骤就会
+#   MSB3721: nasm ... 已退出，返回代码为 1（Unable to open input file）
+# 整个构建直接失败。这里自动建一个**固定名字**的 ASCII 目录联接（junction）
+# 指向当前项目的父目录，再从联接路径进去跑 cargo —— 产物落在同一个物理
+# target\release\ 里（不是另一个目录），只是路径写法变成 ASCII。
+#
+# 联接名固定为 C:\sentinel-rs-ascii（可用 SENTINEL_ASCII_ROOT 覆盖），并且
+# 每次都校验它指向**当前**项目的父目录：指向旧路径就拆掉重建，避免复用了一个
+# 指向别处的联接这种隐蔽错配置。
+$AsciiLinkName = if ($env:SENTINEL_ASCII_ROOT) { $env:SENTINEL_ASCII_ROOT } else { 'C:\sentinel-rs-ascii' }
+if ($Root -notmatch '[^\x00-\x7F]') {
+    Write-Host "[build] 项目路径已是纯 ASCII，无需联接兜底（忽略 $AsciiLinkName）"
+} else {
+    $ParentDir = Split-Path -Parent $Root
+    $needCreate = $true
+    if (Test-Path -LiteralPath $AsciiLinkName) {
+        $existing = Get-Item -LiteralPath $AsciiLinkName -Force
+        if ($existing.LinkType -ne 'Junction') {
+            throw "$AsciiLinkName 已存在且不是目录联接；请删掉它，或用 SENTINEL_ASCII_ROOT 指定另一个位置"
+        }
+        $target = $existing.Target
+        if ($target -and ($target -eq $ParentDir)) {
+            $needCreate = $false
+            Write-Host "[build] ASCII 联接复用：$AsciiLinkName -> $ParentDir"
+        } else {
+            Write-Host "[build] ASCII 联接指向旧路径（$target），重建为 $ParentDir"
+            # 只删联接本身（rmdir 不会动目标目录的内容）
+            cmd.exe /c rmdir "$AsciiLinkName" | Out-Null
+        }
+    }
+    if ($needCreate) {
+        cmd.exe /c mklink /J "$AsciiLinkName" "$ParentDir" | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+            throw "创建 ASCII 目录联接失败：mklink /J `"$AsciiLinkName`" `"$ParentDir`""
+        }
+        Write-Host "[build] 非 ASCII 路径兜底：$AsciiLinkName -> $ParentDir"
+    }
+    $Root = Join-Path $AsciiLinkName (Split-Path -Leaf $Root)
+    if (-not (Test-Path -LiteralPath (Join-Path $Root 'Cargo.toml'))) {
+        throw "ASCII 联接不可用：$Root\Cargo.toml 不存在（检查 $AsciiLinkName 是否指向 $ParentDir）"
+    }
+    Write-Host "[build] 从 ASCII 路径构建：$Root（nasm 需要；产物仍在本项目 target\release\）"
+}
+
 if (-not (Test-Path -LiteralPath $VcVars)) {
     throw "找不到 vcvars64.bat：$VcVars（需要安装 VS2022 的 C++ 桌面开发工作负载）"
 }

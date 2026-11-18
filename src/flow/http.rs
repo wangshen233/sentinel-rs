@@ -14,9 +14,14 @@
 //!
 //! ## emulation
 //!
-//! 默认 `wreq_util::Emulation::Chrome149`（wreq-util 0.2.0 里的最高档 Chrome），
-//! 可用环境变量 `TURB_WREQ_EMULATION` 覆盖（值形如 `Chrome149` / `Chrome146`，
+//! 默认 `wreq_util::Emulation::Chrome146`（wreq-util 0.2.0 里可用的 Chrome 档位），
+//! 可用环境变量 `TURB_WREQ_EMULATION` 覆盖（值形如 `Chrome146` / `Chrome149`，
 //! 大小写 / `_` / `-` 不敏感）。
+//!
+//! ⚠️ 设备指纹路径在 `Chrome140` / `Chrome145` / `Chrome146` / `Chrome149` 四档里
+//! **按档位同版本**配 UA / `sec-ch-ua` / full-version-list（硬规则：TLS 档位必须等于
+//! 声称的版本）。wreq-util 最高只到 `Chrome149`，所以任何路径都**不允许**声称 150+
+//! 的版本 —— 否则握手是 149、UA 说 152，ja4 一比就穿帮。
 //!
 //! ## 离线可测的部分（不碰网络）
 //!
@@ -36,11 +41,11 @@ use wreq_util::{Emulation, Profile};
 
 pub const DEFAULT_TIMEOUT_SECS: u64 = 30;
 
-/// 默认 emulation（wreq-util 0.2.0 提供的最高 Chrome 档）。
+/// 默认 emulation（wreq-util 0.2.0 提供的 Chrome 档，与指纹的 `impersonate` 同档）。
 ///
-/// 注意类型是 [`Profile`]：`wreq_util::Emulation::Chrome149` 是挂在 wreq-util
+/// 注意类型是 [`Profile`]：`wreq_util::Emulation::Chrome146` 是挂在 wreq-util
 /// 的 `Emulation` 配置结构体上的关联常量，值的类型是 `Profile`。
-pub const DEFAULT_EMULATION: Profile = Emulation::Chrome149;
+pub const DEFAULT_EMULATION: Profile = Emulation::Chrome146;
 
 /// 覆盖 emulation 的环境变量名。
 pub const EMULATION_ENV: &str = "TURB_WREQ_EMULATION";
@@ -339,9 +344,142 @@ pub fn normalize_proxy_url(raw: &str) -> Result<String> {
     Ok(with_scheme)
 }
 
+/// 代理清单的环境变量名（每行 `host:port:user:pass`，代理服务商 风格）。
+pub const ENV_PROXY_FILE: &str = "SENTINEL_PROXY_FILE";
+
+/// 代理清单：每行 `host:port:user:pass`，按账号下标轮换。
+///
+/// 规范化后落成 `http://user:pass@host:port`（`user`/`pass` 里的特殊字符做
+/// percent-encode），第 N 个账号用第 `N % len` 行 —— 纯函数式的取模，
+/// 所以天然并发安全（不维护"下一个是谁"的可变状态）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProxyPool {
+    entries: Vec<String>,
+    path: std::path::PathBuf,
+}
+
+impl ProxyPool {
+    /// 读文件并逐行规范化；一个有效行都没有就报错（静默直连是最坏的失败模式）。
+    pub fn load(path: impl AsRef<std::path::Path>) -> Result<Self> {
+        let path = path.as_ref().to_path_buf();
+        let text = std::fs::read_to_string(&path)
+            .with_context(|| format!("读取代理清单失败: {}", path.display()))?;
+        let mut entries = Vec::new();
+        for (i, line) in text.lines().enumerate() {
+            match Self::parse_line(line)
+                .with_context(|| format!("代理清单第 {} 行格式不对", i + 1))?
+            {
+                Some(url) => entries.push(url),
+                None => continue, // 空行 / 注释
+            }
+        }
+        if entries.is_empty() {
+            bail!(
+                "代理清单里没有任何有效行: {}（每行 host:port:user:pass）",
+                path.display()
+            );
+        }
+        debug!(
+            "[http] 代理清单就绪：{} 条（{}）",
+            entries.len(),
+            path.display()
+        );
+        Ok(Self { entries, path })
+    }
+
+    /// 从可注入读取器解析 `SENTINEL_PROXY_FILE`；未设置返回 `Ok(None)`。
+    pub fn from_lookup<F>(lookup: &F) -> Result<Option<Self>>
+    where
+        F: Fn(&str) -> Option<String> + ?Sized,
+    {
+        let raw = lookup(ENV_PROXY_FILE)
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty());
+        match raw {
+            Some(path) => Ok(Some(Self::load(path)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// 解析一行：`host:port` 或 `host:port:user:pass`（也接受带 scheme 的完整 URL）。
+    ///
+    /// 空行 / `#` 注释行返回 `Ok(None)`。
+    pub fn parse_line(line: &str) -> Result<Option<String>> {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            return Ok(None);
+        }
+        if trimmed.contains("://") {
+            return normalize_proxy_url(trimmed).map(Some);
+        }
+        let mut parts = trimmed.splitn(4, ':');
+        let host = parts.next().unwrap_or("").trim();
+        let port = parts.next().unwrap_or("").trim();
+        let user = parts.next().map(str::trim);
+        let pass = parts.next().map(str::trim);
+        if host.is_empty() || port.is_empty() {
+            bail!("需要 host:port 前缀: {trimmed:?}");
+        }
+        if port.parse::<u16>().is_err() {
+            bail!("端口不是合法数字: {trimmed:?}");
+        }
+        let url = match (user, pass) {
+            (Some(user), pass) if !user.is_empty() => {
+                let pass = pass.unwrap_or("");
+                format!(
+                    "http://{}:{}@{host}:{port}",
+                    encode_userinfo(user),
+                    encode_userinfo(pass)
+                )
+            }
+            _ => format!("http://{host}:{port}"),
+        };
+        normalize_proxy_url(&url).map(Some)
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    pub fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+
+    /// 第 `index` 个账号用第 `index % len` 条代理（并发安全：只读 + 取模）。
+    pub fn pick(&self, index: usize) -> Option<&str> {
+        if self.entries.is_empty() {
+            return None;
+        }
+        Some(self.entries[index % self.entries.len()].as_str())
+    }
+
+    /// 全部条目（日志/计划用，调用方负责脱敏）。
+    pub fn entries(&self) -> &[String] {
+        &self.entries
+    }
+}
+
+/// userinfo 的 percent-encode：只保留 unreserved 字符，其余按 `%XX` 编码。
+fn encode_userinfo(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for byte in raw.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(byte as char)
+            }
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
+}
+
 /// 把 `TURB_WREQ_EMULATION` 的字符串映射成 [`Profile`]。
 ///
-/// 接受 `Chrome149` / `chrome_149` / `chrome-149` 这类写法（大小写与分隔符不敏感），
+/// 接受 `Chrome146` / `chrome_146` / `chrome-146` 这类写法（大小写与分隔符不敏感），
 /// 也接受其它 profile（`Firefox148`、`Edge148`、`Safari26`… 取决于 wreq-util 版本）。
 /// 未知名字返回 `None`，由调用方决定回退。
 pub fn parse_emulation(raw: &str) -> Option<Profile> {
@@ -410,6 +548,25 @@ impl Client {
         policy: RetryPolicy,
         emulation: Option<Profile>,
     ) -> Result<Self> {
+        Self::build_with_timeout(
+            user_agent,
+            proxy,
+            policy,
+            emulation,
+            DEFAULT_TIMEOUT_SECS,
+        )
+    }
+
+    /// 指定超时的构造入口：出口国家探测用它（Python 侧 `timeout=10`，比注册链的
+    /// 30s 短，免得一个坏代理把启动卡半分钟）。
+    pub fn build_with_timeout(
+        user_agent: &str,
+        proxy: Option<&str>,
+        policy: RetryPolicy,
+        emulation: Option<Profile>,
+        timeout_secs: u64,
+    ) -> Result<Self> {
+        let timeout_secs = timeout_secs.max(1);
         let jar = Arc::new(Jar::default());
         let emulation = emulation.unwrap_or_else(emulation_from_env);
 
@@ -418,7 +575,7 @@ impl Client {
             // 注意：emulation 必须在 http1/http2/tls 细调之前设置（会覆盖）。
             .emulation(emulation)
             .cookie_provider(jar.clone())
-            .timeout(Duration::from_secs(DEFAULT_TIMEOUT_SECS))
+            .timeout(Duration::from_secs(timeout_secs))
             // 手动跟随重定向，注册链需要看 302 的 Location。
             .redirect(wreq::redirect::Policy::none());
 
@@ -439,7 +596,7 @@ impl Client {
 
         let inner = builder.build().context("构建 wreq HTTP client 失败")?;
         debug!(
-            "[http] client 就绪：emulation={emulation:?} proxy={} timeout={DEFAULT_TIMEOUT_SECS}s",
+            "[http] client 就绪：emulation={emulation:?} proxy={} timeout={timeout_secs}s",
             proxy.map(str::trim).filter(|p| !p.is_empty()).unwrap_or("<直连>")
         );
         Ok(Self {

@@ -62,13 +62,11 @@ fn oracle_profile() -> Profile {
     }
 }
 
-/// challenge 文件：优先当前目录，其次 crate 根（`cargo run` 从任意目录都能跑）。
-fn challenge_path() -> PathBuf {
-    let local = PathBuf::from("sample_challenge.json");
-    if local.is_file() {
-        return local;
-    }
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("sample_challenge.json")
+/// challenge 文件：运行期在仓库根找（cwd / CARGO_MANIFEST_DIR / exe 上级 / SENTINEL_REPO_ROOT）。
+///
+/// 不用 `env!("CARGO_MANIFEST_DIR")`：那是编译期固化的路径，项目搬家就失效。
+fn challenge_path() -> Result<PathBuf, String> {
+    sentinel_rs::paths::find_repo_file("sample_challenge.json")
 }
 
 fn main() {
@@ -82,7 +80,7 @@ fn main() {
 }
 
 fn run() -> Result<i32, String> {
-    let path = challenge_path();
+    let path = challenge_path()?;
     let text = std::fs::read_to_string(&path)
         .map_err(|e| format!("读 {} 失败: {e}", path.display()))?;
     let blob: serde_json::Value =

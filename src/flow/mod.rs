@@ -49,23 +49,28 @@ use crate::fingerprint;
 pub const ENV_PREFIX: &str = "SENTINEL_";
 
 /// 内置 UA：只在**显式覆盖指纹**（未启用随机指纹）时使用。
+///
+/// 版本必须等于 [`http::DEFAULT_EMULATION`] 的档位（`Chrome146`）—— 硬规则
+/// 「TLS 档位必须等于声称的版本」，UA 说 152、握手是 146 就是一眼假的组合。
 pub const DEFAULT_USER_AGENT: &str =
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) \
-     Chrome/145.0.0.0 Safari/537.36";
+     Chrome/146.0.0.0 Safari/537.36";
 
 /// 内置 `accept-language`：与 [`DEFAULT_USER_AGENT`] 配套，同上。
 pub const DEFAULT_ACCEPT_LANGUAGE: &str = "en-US,en;q=0.9";
 
 // ─────────────────────────── 配置 ───────────────────────────
 
-/// 注册流程配置：全部来自环境变量 / `.env`。
+/// 注册流程配置：全部来自环境变量 / `.env` / 命令行。
 ///
 /// | 变量 | 含义 | 缺省 |
 /// |---|---|---|
 /// | `SENTINEL_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` | 代理（`host:port` 或 `http://user:pass@host:port`） | 直连 |
+/// | `SENTINEL_PROXY_FILE` | 代理清单（每行 `host:port:user:pass`），按账号轮换 | 未配置 → 直连 / 单代理 |
 /// | `REG_MAIL_API_BASE_URL` | 邮箱 API 基地址（必填，`https://`） | 未配置 → 不能 `--live` |
 /// | `REG_MAIL_API_TOKEN` | 邮箱 API bearer token（可选） | 空 → 不发鉴权头 |
-/// | `REG_MAIL_ALLOW_INSECURE` | `1` 时放行回环 `http://`（本地自建 / mock） | `0` |
+/// | `REG_MAIL_ALLOW_INSECURE` | `1` 时放行**任意 host** 的明文 `http://`（`code_url` / `base_url`） | `0`（明文 http 一律拒绝） |
+/// | `REG_MAIL_EMAIL_FILE` | 静态邮箱池（每行 `email----code_url`），**优先于** API | 未配置 |
 /// | `SENTINEL_ENABLE_2FA` | 注册后是否绑 TOTP | `false` |
 /// | `SENTINEL_COUNT` / `REGISTER_COUNT` | 批量数量 | `1` |
 /// | `SENTINEL_DB_PATH` | SQLite 路径 | `data/sentinel-rs.db` |
@@ -73,17 +78,35 @@ pub const DEFAULT_ACCEPT_LANGUAGE: &str = "en-US,en;q=0.9";
 /// | `SENTINEL_LIVE_REGISTER` | `1` 才真的联网注册 | `0`（dry-run） |
 /// | `SENTINEL_USER_AGENT` / `SENTINEL_ACCEPT_LANGUAGE` | 指纹相关 | 内置 Chrome UA / `en-US,en;q=0.9` |
 /// | `SENTINEL_FP_SEED` | 设备指纹随机种子（给定则同 seed 可复现） | 空 → 系统随机 |
-/// | `SENTINEL_FP_COUNTRY` | 强制区域（`JP` / `GB` / `DE` …，见 [`fingerprint::REGIONS`]） | 空 → 全表随机 |
+/// | `SENTINEL_FP_COUNTRY` | 强制区域（`JP` / `GB` / `DE` …，见 [`fingerprint::COUNTRY_PROFILES`]） | 空 → 探测出口国家；探测失败才回落 `_DEFAULT_COUNTRY_PROFILE`（UTC + en-US） |
+/// | `SENTINEL_FP_GEO_PROBE` | `0` 关闭「出口国家 → 指纹国家」探测（离线 / 单测） | `1`（开启） |
 ///
 /// ### 设备指纹
 ///
 /// 默认**每次注册现抽一套**自洽指纹（UA / client hints / 屏幕 / 时区 / 语言 / 硬件），
 /// 见 [`fingerprint::DeviceFingerprint`]。一旦显式设置 `SENTINEL_USER_AGENT` 或
 /// `SENTINEL_ACCEPT_LANGUAGE`，就**不再随机**（保持调用方给的那一套，旧行为）。
+///
+/// ### 邮箱来源（互斥，静态池优先）
+///
+/// * `REG_MAIL_EMAIL_FILE`：静态池（用户给的固定邮箱 + 取码链接），不调 `POST /mailboxes`；
+/// * `REG_MAIL_API_BASE_URL`：现领邮箱 API。
+///
+/// ### 代理轮换
+///
+/// `--proxy` / `SENTINEL_PROXY` **优先**（用于"本地 10808 → 上游动态"的链式场景）；
+/// 没给单代理时才用 `--proxy-file` / `SENTINEL_PROXY_FILE` 里的第 `N % len` 条。
 #[derive(Debug, Clone)]
 pub struct RegisterConfig {
     pub proxy: Option<String>,
+    /// 代理清单（按账号下标轮换）。`--proxy` / `SENTINEL_PROXY` 优先于它。
+    pub proxy_pool: Option<http::ProxyPool>,
     pub email_api: Option<email::EmailApiConfig>,
+    /// 静态邮箱池（`REG_MAIL_EMAIL_FILE`）：设置后不再调 `POST /mailboxes`。
+    pub static_email_pool: Option<email::StaticEmailPool>,
+    /// `REG_MAIL_ALLOW_INSECURE=1`：放行任意 host 的明文 `http://`
+    /// （`code_url` 与 `REG_MAIL_API_BASE_URL` 共用同一个开关）。
+    pub mail_allow_insecure: bool,
     pub enable_2fa: bool,
     pub count: usize,
     pub db_path: PathBuf,
@@ -94,6 +117,11 @@ pub struct RegisterConfig {
     /// 本次注册的设备指纹。`None` = 到 [`register_once`] 时按环境现生成（每账号一套）；
     /// `Some` = 调用方指定（CLI 打印/复现时也会预先写进来，保证"打印的 == 实际用的"）。
     pub fingerprint: Option<fingerprint::DeviceFingerprint>,
+    /// 当前账号下标（0 起）：决定代理清单取第几条、日志里区分批次。
+    pub account_index: usize,
+    /// 本次指纹要用的国家码（大写两位）：`SENTINEL_FP_COUNTRY` 显式指定 >
+    /// 出口国家探测结果 > `None`（回落 `_DEFAULT_COUNTRY_PROFILE`）。
+    pub fp_country: Option<String>,
     pub dry_run: bool,
     /// 只跑 warmup → signin → authorize init（不领邮箱、不注册），验证会话建立。
     pub preflight: bool,
@@ -103,7 +131,10 @@ impl Default for RegisterConfig {
     fn default() -> Self {
         Self {
             proxy: None,
+            proxy_pool: None,
             email_api: None,
+            static_email_pool: None,
+            mail_allow_insecure: false,
             enable_2fa: false,
             count: 1,
             db_path: PathBuf::from("data/sentinel-rs.db"),
@@ -112,6 +143,8 @@ impl Default for RegisterConfig {
             user_agent: DEFAULT_USER_AGENT.to_string(),
             accept_language: DEFAULT_ACCEPT_LANGUAGE.to_string(),
             fingerprint: None,
+            account_index: 0,
+            fp_country: None,
             dry_run: true,
             preflight: false,
         }
@@ -161,6 +194,14 @@ impl RegisterConfig {
         }
 
         let email_api = email::EmailApiConfig::from_lookup(&lookup)?;
+        // 显式指定的指纹国家（大写两位）；留空 → 交给出口国家探测
+        let fp_country = get("SENTINEL_FP_COUNTRY")
+            .map(|v| v.trim().to_ascii_uppercase())
+            .filter(|v| !v.is_empty());
+        // 静态邮箱池优先于 API：设置后完全不走 `POST /mailboxes`。
+        let static_email_pool = email::StaticEmailPool::from_lookup(&lookup);
+        let mail_allow_insecure = email::allow_insecure_from_lookup(&lookup);
+        let proxy_pool = http::ProxyPool::from_lookup(&lookup)?;
 
         let dry_run = match get("SENTINEL_LIVE_REGISTER") {
             Some(v) => !matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"),
@@ -169,7 +210,10 @@ impl RegisterConfig {
 
         Ok(Self {
             proxy,
+            proxy_pool,
             email_api,
+            static_email_pool,
+            mail_allow_insecure,
             enable_2fa: matches!(
                 get("SENTINEL_ENABLE_2FA")
                     .unwrap_or_default()
@@ -190,6 +234,9 @@ impl RegisterConfig {
             // 指纹默认推迟到 register_once 里按账号生成（`SENTINEL_FP_SEED` /
             // `SENTINEL_FP_COUNTRY` 在生成时读取）；显式 UA / 语言覆盖时不生成。
             fingerprint: None,
+            account_index: 0,
+            // 显式指定的国家优先于出口探测（探测在 main / register_once 里做）
+            fp_country,
             dry_run,
             preflight: false,
         })
@@ -215,6 +262,10 @@ impl RegisterConfig {
 
     /// 本次注册要用的设备指纹：显式注入了就用它，否则按环境现生成一套。
     ///
+    /// 国家优先级：`SENTINEL_FP_COUNTRY` / [`Self::fp_country`]（显式）>
+    /// 出口国家探测（见 [`probe_exit_country`]）> 空 → `_DEFAULT_COUNTRY_PROFILE`
+    /// （`UTC` + `en-US,en`，与 Python 完全一致）。
+    ///
     /// 返回 `None` 表示"不随机"（显式 UA / 语言覆盖）。
     pub fn resolve_fingerprint(&self) -> Option<fingerprint::DeviceFingerprint> {
         if let Some(fp) = &self.fingerprint {
@@ -223,14 +274,22 @@ impl RegisterConfig {
         if self.has_ua_override() {
             return None;
         }
-        Some(fingerprint::generate_from_env())
+        let country = self
+            .fp_country
+            .clone()
+            .filter(|c| !c.trim().is_empty())
+            .or_else(fingerprint::country_from_env);
+        Some(fingerprint::DeviceFingerprint::generate_for_country(
+            fingerprint::seed_from_env().as_deref(),
+            country.as_deref(),
+        ))
     }
 
     /// 把指纹投影到 UA / `accept-language`（token profile 与 HTTP 头共用同一份）。
     pub fn with_fingerprint(mut self) -> Self {
         if let Some(fp) = self.resolve_fingerprint() {
             self.user_agent = fp.user_agent.clone();
-            self.accept_language = fp.languages.clone();
+            self.accept_language = fp.lang_full.clone();
             self.fingerprint = Some(fp);
         }
         self
@@ -256,16 +315,44 @@ impl RegisterConfig {
         }
     }
 
+    /// 本次账号要用的代理：`--proxy` / `SENTINEL_PROXY` 优先，其次代理清单轮换。
+    pub fn proxy_for_account(&self, index: usize) -> Option<String> {
+        if let Some(raw) = &self.proxy {
+            if !raw.trim().is_empty() {
+                return Some(raw.trim().to_string());
+            }
+        }
+        self.proxy_pool
+            .as_ref()
+            .and_then(|pool| pool.pick(index))
+            .map(str::to_string)
+    }
+
+    /// 邮箱来源描述（CLI 打印用）。
+    pub fn mailbox_source(&self) -> String {
+        if let Some(pool) = &self.static_email_pool {
+            return format!(
+                "静态池 {}（明文 http {}）",
+                pool.path().display(),
+                if pool.allow_insecure() { "已放行" } else { "拒绝" }
+            );
+        }
+        match &self.email_api {
+            Some(api) => format!("邮箱 API {}", api.base_url),
+            None => "<未配置：REG_MAIL_EMAIL_FILE / REG_MAIL_API_BASE_URL>".to_string(),
+        }
+    }
+
     /// 真实链路必须有的东西；dry-run 不做强制（沙箱里也能跑 `register -n 1`）。
     pub fn require_live_prerequisites(&self) -> Result<()> {
         if self.dry_run {
             return Ok(());
         }
-        if self.email_api.is_none() {
+        if self.static_email_pool.is_none() && self.email_api.is_none() {
             bail!(
-                "缺少邮箱 API 配置：请设置 REG_MAIL_API_BASE_URL（必填，https://），\
-                 需要鉴权时再设 REG_MAIL_API_TOKEN；本地自建 / mock 服务另需 \
-                 REG_MAIL_ALLOW_INSECURE=1"
+                "缺少邮箱来源：请设置 REG_MAIL_EMAIL_FILE（固定邮箱 + 取码链接，每行 \
+                 email----code_url），或 REG_MAIL_API_BASE_URL（现领邮箱 API，默认必须 \
+                 https://；明文 http 需 REG_MAIL_ALLOW_INSECURE=1）"
             );
         }
         Ok(())
@@ -366,8 +453,17 @@ impl RegisterIdentity {
 /// 进来第一件事是**定下本次的设备指纹**：UA / `accept-language` / client hints /
 /// token profile / TLS emulation 全部由这一份派生，保证一个账号一套且完全自洽。
 pub async fn register_once(cfg: &RegisterConfig) -> Result<RegistrationOutcome> {
-    let cfg = cfg.clone().with_fingerprint();
+    let mut cfg = cfg.clone();
+    // 代理按账号轮换：`--proxy` 优先，否则取清单第 `index % len` 条。
+    cfg.proxy = cfg.proxy_for_account(cfg.account_index);
+    // 出口国家 → 指纹（Python `_probe_country_before_fingerprint` 的顺序：
+    // 先探测国家，再 generate_fingerprint(country_code=…)）。
+    cfg = prepare_fingerprint(cfg).await;
     log_fingerprint(&cfg);
+    log_geo_mapping(&cfg);
+    if let Some(proxy) = &cfg.proxy {
+        debug!("[proxy] 账号 #{} 使用 {}", cfg.account_index + 1, mask_proxy(proxy));
+    }
     if cfg.dry_run {
         return register_once_with(&cfg, &MissingSentinelSource).await;
     }
@@ -381,11 +477,158 @@ pub async fn register_once(cfg: &RegisterConfig) -> Result<RegistrationOutcome> 
     register_once_with(&cfg, &source).await
 }
 
+/// 定下本次指纹：先（必要时）探测出口国家，再生成整套画像。
+///
+/// 顺序必须是这样 —— 时区/语言是从国家画像里抽的，先定国家才谈得上"和出口 IP 对齐"。
+async fn prepare_fingerprint(mut cfg: RegisterConfig) -> RegisterConfig {
+    if cfg.fingerprint.is_some() || cfg.has_ua_override() {
+        return cfg.with_fingerprint();
+    }
+    // dry-run 承诺"不联网"，所以只有真实链路才探测出口国家
+    if cfg.fp_country.is_none() && !cfg.dry_run {
+        cfg.fp_country = probe_exit_country_if(geo_probe_enabled(), cfg.proxy.as_deref()).await;
+    }
+    cfg.with_fingerprint()
+}
+
+/// 打印「出口国家 → 时区 / 语言」的落点，方便人工核对指纹与出口 IP 是否一致。
+fn log_geo_mapping(cfg: &RegisterConfig) {
+    let Some(fp) = &cfg.fingerprint else {
+        return;
+    };
+    match cfg.fp_country.as_deref().map(str::trim).filter(|c| !c.is_empty()) {
+        Some(country) => info!(
+            "[fp] 出口国家={country} → 时区={} / 语言={}",
+            fp.timezone, fp.lang
+        ),
+        None => info!(
+            "[fp] 出口国家未知（探测失败 / 已关闭）→ 时区={} / 语言={}",
+            fp.timezone, fp.lang
+        ),
+    }
+}
+
+// ─────────────────────── 出口 IP 国家探测 ───────────────────────
+
+/// 关闭出口国家探测的环境变量（`0` / `false` / `off` / `no` → 关闭）。
+pub const GEO_PROBE_ENV: &str = "SENTINEL_FP_GEO_PROBE";
+/// 与 Python `auth_flow.py::_probe_country_before_fingerprint` 完全相同的端点。
+pub const GEO_TRACE_URL: &str = "https://cloudflare.com/cdn-cgi/trace";
+/// 探测超时秒数（Python 侧 `timeout=10`）。
+pub const GEO_PROBE_TIMEOUT_SECS: u64 = 10;
+
+/// 出口国家探测是否开启（默认开启，对齐 Python「总是探测」）。
+pub fn geo_probe_enabled() -> bool {
+    geo_probe_enabled_from_lookup(&|key| std::env::var(key).ok())
+}
+
+/// 可注入读取器版本（单测用，不污染进程环境）。
+pub fn geo_probe_enabled_from_lookup<F>(lookup: &F) -> bool
+where
+    F: Fn(&str) -> Option<String> + ?Sized,
+{
+    match lookup(GEO_PROBE_ENV) {
+        Some(raw) => !matches!(
+            raw.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "off" | "no"
+        ),
+        None => true,
+    }
+}
+
+/// 从 `cloudflare.com/cdn-cgi/trace` 的文本里取 `loc=XX`（Python 同样只看这一行）。
+///
+/// 只取两位字母/数字并转大写：`loc=IN` → `IN`；`loc=T1`（Tor）也会原样返回，
+/// 落到 [`fingerprint::country_profile`] 时按未知国家回退默认画像。
+pub fn parse_trace_country(body: &str) -> Option<String> {
+    for line in body.lines() {
+        let Some(rest) = line.trim().strip_prefix("loc=") else {
+            continue;
+        };
+        let code = rest.trim().to_ascii_uppercase();
+        if code.len() == 2 && code.chars().all(|c| c.is_ascii_alphanumeric()) {
+            return Some(code);
+        }
+    }
+    None
+}
+
+/// Best-effort 探测代理出口国家：**任何失败都返回 `None`，绝不影响注册主流程**。
+///
+/// 与 Python 一致：没有代理就不探测（直连拿到的是本机国家，没有意义）。
+pub async fn probe_exit_country(proxy: Option<&str>) -> Option<String> {
+    let Some(proxy) = proxy.map(str::trim).filter(|p| !p.is_empty()) else {
+        debug!("[fp] 没有代理，跳过出口国家探测");
+        return None;
+    };
+    let client = match http::Client::build_with_timeout(
+        DEFAULT_USER_AGENT,
+        Some(proxy),
+        http::RetryPolicy::default(),
+        http::parse_emulation("Chrome146"),
+        GEO_PROBE_TIMEOUT_SECS,
+    ) {
+        Ok(client) => client,
+        Err(err) => {
+            debug!("[fp] 出口国家探测跳过（客户端构造失败）: {err:#}");
+            return None;
+        }
+    };
+    let spec = http::RequestSpec::get("fp.geo_probe", GEO_TRACE_URL).with_headers(vec![
+        ("accept".to_string(), "text/plain,text/html".to_string()),
+        ("cache-control".to_string(), "no-cache".to_string()),
+    ]);
+    match client.execute(&spec).await {
+        Ok(resp) => {
+            if !resp.is_success() {
+                debug!("[fp] 出口国家探测失败：HTTP {}", resp.status);
+                return None;
+            }
+            let country = parse_trace_country(http::body_string(&resp));
+            match &country {
+                Some(code) => info!("[fp] 启动前代理国家探测: {code}"),
+                None => debug!("[fp] trace 响应里没有 loc= 行"),
+            }
+            country
+        }
+        Err(err) => {
+            debug!("[fp] 出口国家探测失败: {err:#}");
+            None
+        }
+    }
+}
+
+/// `enabled=false` 时**一个请求都不发**（单测 / 离线用 `SENTINEL_FP_GEO_PROBE=0`）。
+pub async fn probe_exit_country_if(enabled: bool, proxy: Option<&str>) -> Option<String> {
+    if !enabled {
+        debug!("[fp] {GEO_PROBE_ENV}=0：跳过出口国家探测");
+        return None;
+    }
+    probe_exit_country(proxy).await
+}
+
 /// 打一行本次实际使用的设备画像（`SENTINEL_LOG=info` 默认可见）。
 fn log_fingerprint(cfg: &RegisterConfig) {
     match &cfg.fingerprint {
-        Some(fp) => info!("[fp] {} ua={}", fp.summary(), fp.user_agent),
+        Some(fp) => info!(
+            "[fp] {} ua={} ch={} lang={}",
+            fp.summary(),
+            fp.user_agent,
+            fp.sec_ch_ua,
+            fp.lang_full
+        ),
         None => info!("[fp] 固定指纹（显式 UA / 语言覆盖）: ua={}", cfg.user_agent),
+    }
+}
+
+/// 日志里的代理脱敏：`http://user:pass@host:port` → `http://***:***@host:port`。
+fn mask_proxy(raw: &str) -> String {
+    let Some((scheme, rest)) = raw.split_once("://") else {
+        return raw.to_string();
+    };
+    match rest.rsplit_once('@') {
+        Some((_userinfo, hostport)) => format!("{scheme}://***:***@{hostport}"),
+        None => raw.to_string(),
     }
 }
 
@@ -424,8 +667,11 @@ pub async fn register_once_with(
 /// 存在的意义：链路上任何一步坏掉都会在下游 `user/register` 变成
 /// 409 invalid_state，而那时邮箱已经花掉了 —— 先在这里用 0 成本把状态摸清。
 pub async fn preflight_authorize(cfg: &RegisterConfig) -> Result<Vec<String>> {
-    let cfg = cfg.clone().with_fingerprint();
+    let mut cfg = cfg.clone();
+    cfg.proxy = cfg.proxy_for_account(cfg.account_index);
+    cfg = prepare_fingerprint(cfg).await;
     log_fingerprint(&cfg);
+    log_geo_mapping(&cfg);
 
     let http = http::Client::build_with_emulation(
         &cfg.user_agent,
@@ -481,10 +727,6 @@ async fn live_register(
     use auth::Intent;
 
     cfg.require_live_prerequisites()?;
-    let email_api = cfg
-        .email_api
-        .as_ref()
-        .context("缺少邮箱 API 配置（REG_MAIL_API_BASE_URL）")?;
 
     let http = http::Client::build_with_emulation(
         &cfg.user_agent,
@@ -492,7 +734,11 @@ async fn live_register(
         http::RetryPolicy::default(),
         cfg.emulation_profile(),
     )?;
-    let mail = email::MailApiClient::new(&http, email_api.clone());
+    // 现领邮箱 API 客户端（静态池模式下不构造：那种模式没有 API 基地址）。
+    let mail = cfg
+        .email_api
+        .as_ref()
+        .map(|api| email::MailApiClient::new(&http, api.clone()));
 
     // 0) warmup：GET chatgpt.com/api/auth/csrf —— 种 oai-did。
     //    Python run_register 的第一件事，且必须在领邮箱之前拦掉：没有 oai-did 的会话
@@ -501,11 +747,16 @@ async fn live_register(
     let probe = cfg.auth_builder("");
     let warm = authorize::warmup(&http, &probe).await?;
 
-    // 1) 建/领邮箱
-    let mailbox = mail
-        .create_mailbox(None, None)
-        .await
-        .context("创建邮箱失败")?;
+    // 1) 建/领邮箱：静态池优先（用户给的固定邮箱 + 取码链接），否则调 POST /mailboxes
+    let mailbox = match &cfg.static_email_pool {
+        Some(pool) => pool.next().context("从静态邮箱池取下一行失败")?,
+        None => mail
+            .as_ref()
+            .context("缺少邮箱 API 配置（REG_MAIL_API_BASE_URL）")?
+            .create_mailbox(None, None)
+            .await
+            .context("创建邮箱失败")?,
+    };
     let mut identity = RegisterIdentity::new(mailbox.email.clone());
     // oai-did 必须用 warmup 种下的那个（Python `_resolve_device_id`：cookie 优先，
     // 凭空 uuid4 服务端不认这个会话 —— 那正是 409 invalid_state 的上游根因）
@@ -622,15 +873,15 @@ async fn live_register(
     }
     info!("[6/10] OTP 已发送");
 
-    // 6) 取码
-    let code = mail
-        .poll_otp(
-            &mailbox.code_url,
-            cfg.otp_max_wait_secs,
-            cfg.otp_poll_interval_secs,
-        )
-        .await
-        .context("等待邮箱验证码失败")?;
+    // 6) 取码（静态池 / API 同一条路径：GET {code_url} + HTML 卡片解析）
+    let code = email::poll_otp_url(
+        &http,
+        &mailbox.code_url,
+        cfg.otp_max_wait_secs,
+        cfg.otp_poll_interval_secs,
+    )
+    .await
+    .context("等待邮箱验证码失败")?;
     info!("已取得邮箱验证码");
 
     // 8) 验证 OTP（该 flow 服务端要求 SO token）

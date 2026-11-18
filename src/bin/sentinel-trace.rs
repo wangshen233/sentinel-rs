@@ -37,10 +37,16 @@ pub fn load_program(encoded: &str, key: &str) -> Result<Vec<Vec<Value>>, String>
 }
 
 fn main() {
-    let path = std::env::args()
-        .nth(1)
-        .unwrap_or_else(|| "sample_challenge.json".into());
-    let text = std::fs::read_to_string(&path).expect("read challenge");
+    let path_arg = std::env::args().nth(1);
+    let path = sentinel_rs::paths::resolve_optional(path_arg.as_deref(), "sample_challenge.json")
+        .unwrap_or_else(|err| {
+            eprintln!("[sentinel-trace] {err}");
+            std::process::exit(1);
+        });
+    let text = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+        eprintln!("[sentinel-trace] 读不到 {}: {e}", path.display());
+        std::process::exit(1);
+    });
     let blob: serde_json::Value = serde_json::from_str(&text).expect("parse json");
     let p = blob.get("p").and_then(|v| v.as_str()).unwrap_or("").to_string();
     let challenge = blob.get("challenge").cloned().unwrap_or_else(|| blob.clone());

@@ -141,7 +141,7 @@ pub fn tz_table(name: &str) -> Option<TzInfo> {
             zh: "太平洋标准时间",
             offset: -480,
         },
-        // 下面这批是设备指纹区域表（`fingerprint::REGIONS`）用到的时区：
+        // 下面这批是设备指纹国家画像（`fingerprint::COUNTRY_PROFILES`）用到的时区：
         // 缺了它们，`Profile::new` 会把偏移退成默认 +540，时区名和偏移就自相矛盾。
         "Europe/London" => TzInfo {
             en: "Greenwich Mean Time",
@@ -184,6 +184,304 @@ pub fn tz_table(name: &str) -> Option<TzInfo> {
             ja: "東部標準時",
             zh: "东部标准时间",
             offset: -300,
+        },
+        // ── 以下补齐 `fingerprint::COUNTRY_PROFILES`（Python `_COUNTRY_PROFILES`）
+        // 用到的全部时区。缺一个就意味着 `Profile::new` 把偏移退成默认 +540，
+        // 出现「时区名说 Europe/London、偏移说 +540」的自相矛盾。
+        // 偏移取该时区的**标准时**（不含夏令时），与 Python 侧非夏令时时段一致。
+        "Asia/Hong_Kong" => TzInfo {
+            en: "Hong Kong Standard Time",
+            ja: "香港標準時",
+            zh: "香港标准时间",
+            offset: 480,
+        },
+        "Asia/Taipei" => TzInfo {
+            en: "Taipei Standard Time",
+            ja: "台湾標準時",
+            zh: "台北标准时间",
+            offset: 480,
+        },
+        "Asia/Kuala_Lumpur" => TzInfo {
+            en: "Malaysia Time",
+            ja: "マレーシア時間",
+            zh: "马来西亚时间",
+            offset: 480,
+        },
+        "Asia/Bangkok" => TzInfo {
+            en: "Indochina Time",
+            ja: "インドシナ時間",
+            zh: "印度支那时间",
+            offset: 420,
+        },
+        "Asia/Ho_Chi_Minh" => TzInfo {
+            en: "Indochina Time",
+            ja: "インドシナ時間",
+            zh: "印度支那时间",
+            offset: 420,
+        },
+        "Asia/Kolkata" => TzInfo {
+            en: "India Standard Time",
+            ja: "インド標準時",
+            zh: "印度标准时间",
+            offset: 330,
+        },
+        "Asia/Jakarta" => TzInfo {
+            en: "Western Indonesia Time",
+            ja: "インドネシア西部時間",
+            zh: "印度尼西亚西部时间",
+            offset: 420,
+        },
+        "Asia/Manila" => TzInfo {
+            en: "Philippine Standard Time",
+            ja: "フィリピン標準時",
+            zh: "菲律宾标准时间",
+            offset: 480,
+        },
+        "Asia/Karachi" => TzInfo {
+            en: "Pakistan Standard Time",
+            ja: "パキスタン標準時",
+            zh: "巴基斯坦标准时间",
+            offset: 300,
+        },
+        "Asia/Dhaka" => TzInfo {
+            en: "Bangladesh Standard Time",
+            ja: "バングラデシュ標準時",
+            zh: "孟加拉国标准时间",
+            offset: 360,
+        },
+        "Asia/Jerusalem" => TzInfo {
+            en: "Israel Standard Time",
+            ja: "イスラエル標準時",
+            zh: "以色列标准时间",
+            offset: 120,
+        },
+        "Asia/Riyadh" => TzInfo {
+            en: "Arabia Standard Time",
+            ja: "アラビア標準時",
+            zh: "阿拉伯标准时间",
+            offset: 180,
+        },
+        "Asia/Dubai" => TzInfo {
+            en: "Gulf Standard Time",
+            ja: "湾岸標準時",
+            zh: "海湾标准时间",
+            offset: 240,
+        },
+        "Asia/Yekaterinburg" => TzInfo {
+            en: "Yekaterinburg Standard Time",
+            ja: "エカテリンブルク標準時",
+            zh: "叶卡捷琳堡标准时间",
+            offset: 300,
+        },
+        "Asia/Novosibirsk" => TzInfo {
+            en: "Novosibirsk Standard Time",
+            ja: "ノボシビルスク標準時",
+            zh: "新西伯利亚标准时间",
+            offset: 420,
+        },
+        "Europe/Istanbul" => TzInfo {
+            en: "Turkey Time",
+            ja: "トルコ時間",
+            zh: "土耳其时间",
+            offset: 180,
+        },
+        "Europe/Rome" => TzInfo {
+            en: "Central European Time",
+            ja: "中央ヨーロッパ時間",
+            zh: "中欧时间",
+            offset: 60,
+        },
+        "Europe/Madrid" => TzInfo {
+            en: "Central European Time",
+            ja: "中央ヨーロッパ時間",
+            zh: "中欧时间",
+            offset: 60,
+        },
+        "Europe/Brussels" => TzInfo {
+            en: "Central European Time",
+            ja: "中央ヨーロッパ時間",
+            zh: "中欧时间",
+            offset: 60,
+        },
+        "Europe/Zurich" => TzInfo {
+            en: "Central European Time",
+            ja: "中央ヨーロッパ時間",
+            zh: "中欧时间",
+            offset: 60,
+        },
+        "Europe/Stockholm" => TzInfo {
+            en: "Central European Time",
+            ja: "中央ヨーロッパ時間",
+            zh: "中欧时间",
+            offset: 60,
+        },
+        "Europe/Oslo" => TzInfo {
+            en: "Central European Time",
+            ja: "中央ヨーロッパ時間",
+            zh: "中欧时间",
+            offset: 60,
+        },
+        "Europe/Copenhagen" => TzInfo {
+            en: "Central European Time",
+            ja: "中央ヨーロッパ時間",
+            zh: "中欧时间",
+            offset: 60,
+        },
+        "Europe/Warsaw" => TzInfo {
+            en: "Central European Time",
+            ja: "中央ヨーロッパ時間",
+            zh: "中欧时间",
+            offset: 60,
+        },
+        "Europe/Prague" => TzInfo {
+            en: "Central European Time",
+            ja: "中央ヨーロッパ時間",
+            zh: "中欧时间",
+            offset: 60,
+        },
+        "Europe/Vienna" => TzInfo {
+            en: "Central European Time",
+            ja: "中央ヨーロッパ時間",
+            zh: "中欧时间",
+            offset: 60,
+        },
+        "Europe/Helsinki" => TzInfo {
+            en: "Eastern European Standard Time",
+            ja: "東ヨーロッパ標準時",
+            zh: "东欧标准时间",
+            offset: 120,
+        },
+        "Europe/Kiev" => TzInfo {
+            en: "Eastern European Standard Time",
+            ja: "東ヨーロッパ標準時",
+            zh: "东欧标准时间",
+            offset: 120,
+        },
+        "Europe/Athens" => TzInfo {
+            en: "Eastern European Standard Time",
+            ja: "東ヨーロッパ標準時",
+            zh: "东欧标准时间",
+            offset: 120,
+        },
+        "Europe/Moscow" => TzInfo {
+            en: "Moscow Standard Time",
+            ja: "モスクワ標準時",
+            zh: "莫斯科标准时间",
+            offset: 180,
+        },
+        "Europe/Lisbon" => TzInfo {
+            en: "Western European Standard Time",
+            ja: "西ヨーロッパ標準時",
+            zh: "西欧标准时间",
+            offset: 0,
+        },
+        "America/Chicago" => TzInfo {
+            en: "Central Standard Time",
+            ja: "中部標準時",
+            zh: "中部标准时间",
+            offset: -360,
+        },
+        "America/Denver" => TzInfo {
+            en: "Mountain Standard Time",
+            ja: "山地標準時",
+            zh: "山地标准时间",
+            offset: -420,
+        },
+        "America/Edmonton" => TzInfo {
+            en: "Mountain Standard Time",
+            ja: "山地標準時",
+            zh: "山地标准时间",
+            offset: -420,
+        },
+        "America/Vancouver" => TzInfo {
+            en: "Pacific Standard Time",
+            ja: "太平洋標準時",
+            zh: "太平洋标准时间",
+            offset: -480,
+        },
+        "America/Mexico_City" => TzInfo {
+            en: "Central Standard Time (Mexico)",
+            ja: "メキシコ中部標準時",
+            zh: "墨西哥中部标准时间",
+            offset: -360,
+        },
+        "America/Bogota" => TzInfo {
+            en: "Colombia Standard Time",
+            ja: "コロンビア標準時",
+            zh: "哥伦比亚标准时间",
+            offset: -300,
+        },
+        "America/Santiago" => TzInfo {
+            en: "Chile Standard Time",
+            ja: "チリ標準時",
+            zh: "智利标准时间",
+            offset: -240,
+        },
+        "America/Sao_Paulo" => TzInfo {
+            en: "Brasilia Standard Time",
+            ja: "ブラジリア標準時",
+            zh: "巴西利亚标准时间",
+            offset: -180,
+        },
+        "America/Fortaleza" => TzInfo {
+            en: "Brasilia Standard Time",
+            ja: "ブラジリア標準時",
+            zh: "巴西利亚标准时间",
+            offset: -180,
+        },
+        "America/Manaus" => TzInfo {
+            en: "Amazon Standard Time",
+            ja: "アマゾン標準時",
+            zh: "亚马逊标准时间",
+            offset: -240,
+        },
+        "America/Argentina/Buenos_Aires" => TzInfo {
+            en: "Argentina Standard Time",
+            ja: "アルゼンチン標準時",
+            zh: "阿根廷标准时间",
+            offset: -180,
+        },
+        "Australia/Melbourne" => TzInfo {
+            en: "Australian Eastern Standard Time",
+            ja: "オーストラリア東部標準時",
+            zh: "澳大利亚东部标准时间",
+            offset: 600,
+        },
+        "Australia/Brisbane" => TzInfo {
+            en: "Australian Eastern Standard Time",
+            ja: "オーストラリア東部標準時",
+            zh: "澳大利亚东部标准时间",
+            offset: 600,
+        },
+        "Pacific/Auckland" => TzInfo {
+            en: "New Zealand Standard Time",
+            ja: "ニュージーランド標準時",
+            zh: "新西兰标准时间",
+            offset: 720,
+        },
+        "Africa/Johannesburg" => TzInfo {
+            en: "South Africa Standard Time",
+            ja: "南アフリカ標準時",
+            zh: "南非标准时间",
+            offset: 120,
+        },
+        "Africa/Cairo" => TzInfo {
+            en: "Eastern European Standard Time",
+            ja: "東ヨーロッパ標準時",
+            zh: "东欧标准时间",
+            offset: 120,
+        },
+        "Africa/Lagos" => TzInfo {
+            en: "West Africa Standard Time",
+            ja: "西アフリカ標準時",
+            zh: "西非标准时间",
+            offset: 60,
+        },
+        "Africa/Nairobi" => TzInfo {
+            en: "East Africa Time",
+            ja: "東アフリカ時間",
+            zh: "东非时间",
+            offset: 180,
         },
         _ => return None,
     };
@@ -572,6 +870,18 @@ pub struct ProfileOptions {
     pub device_memory: Option<i64>,
     pub device_pixel_ratio: Option<f64>,
     pub timezone: Option<String>,
+    /// `navigator.userAgentData.brands`（由 `sec-ch-ua` 解析出的 brand/version）
+    pub ua_brands: Option<Vec<Brand>>,
+    /// `sec-ch-ua-platform-version` 的高熵真值（Win11 = `15.0.0`）
+    pub ua_platform_version: Option<String>,
+    /// `sec-ch-ua-arch` 的高熵真值（桌面 Chrome = `x86`）
+    pub ua_arch: Option<String>,
+    /// `sec-ch-ua-bitness` 的高熵真值（桌面 Chrome = `64`）
+    pub ua_bitness: Option<String>,
+    /// `navigator.maxTouchPoints`（桌面 Chrome = 0）
+    pub max_touch_points: Option<i64>,
+    /// `navigator.userAgentData.mobile`（桌面 Chrome = false）
+    pub is_mobile: Option<bool>,
 }
 
 /// `_country_defaults()` 的输入（Python 侧来自 `fingerprint._COUNTRY_PROFILES`）。
@@ -649,12 +959,24 @@ impl Profile {
                 .unwrap_or_else(|| "Google Inc.".to_string()),
             device_memory: opts.device_memory.filter(|v| *v != 0).unwrap_or(8),
             device_pixel_ratio: opts.device_pixel_ratio.filter(|v| *v != 0.0).unwrap_or(1.0),
-            max_touch_points: 0,
-            ua_brands: Vec::new(),
-            ua_platform_version: String::new(),
-            ua_arch: String::new(),
-            ua_bitness: String::new(),
-            is_mobile: false,
+            max_touch_points: opts.max_touch_points.filter(|v| *v >= 0).unwrap_or(0),
+            ua_brands: opts.ua_brands.clone().unwrap_or_default(),
+            ua_platform_version: opts
+                .ua_platform_version
+                .clone()
+                .filter(|s| !s.is_empty())
+                .unwrap_or_default(),
+            ua_arch: opts
+                .ua_arch
+                .clone()
+                .filter(|s| !s.is_empty())
+                .unwrap_or_default(),
+            ua_bitness: opts
+                .ua_bitness
+                .clone()
+                .filter(|s| !s.is_empty())
+                .unwrap_or_default(),
+            is_mobile: opts.is_mobile.unwrap_or(false),
             page_time_origin_ms: now_ms - rng.uniform(8.0, 40.0),
         }
     }
@@ -779,6 +1101,13 @@ impl Profile {
     }
 }
 
+/// ⚠️ 这个默认 UA 必须与 Python `sentinel_py._profile()` 的内置默认**逐字一致**
+/// （`Chrome/145.0.0.0`），否则 `token_check` 的 `explicit` 用例会出现 PoW attempt 漂移
+/// （UA 进了 embedded JSON → 哈希不同 → attempt 不同）。
+///
+/// 它**不**决定注册时的 UA：真实注册走设备指纹（[`crate::fingerprint::DeviceFingerprint`]），
+/// UA 与 TLS 档位同版本（`Chrome/140|145|146|149.0.0.0`）；只有调用方连 UA 都没给时
+/// 才会退到这里（Python oracle 的默认档，逐字对齐）。
 const DEFAULT_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36";
 

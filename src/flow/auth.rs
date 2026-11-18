@@ -233,7 +233,7 @@ impl AuthRequestBuilder {
     /// [`ClientHints::from_user_agent`] 已经能从 UA 推出对应平台。
     pub fn with_fingerprint(mut self, fp: &DeviceFingerprint) -> Self {
         self.user_agent = fp.user_agent.clone();
-        self.accept_language = fp.languages.clone();
+        self.accept_language = fp.lang_full.clone();
         self.hints = Some(ClientHints::from_fingerprint(fp));
         self
     }

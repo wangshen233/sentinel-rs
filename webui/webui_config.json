@@ -1,0 +1,18 @@
+{
+  "count": 1,
+  "concurrency": 1,
+  "email_file": "C:\\Users\\<user>\\Downloads\\mailboxes.txt",
+  "proxy_mode": "none",
+  "proxy": "",
+  "proxy_file": "C:\\Users\\<user>\\Downloads\\proxies.txt",
+  "mail_allow_insecure": false,
+  "enable_2fa": false,
+  "otp_max_wait": 777,
+  "otp_poll_interval": 3,
+  "live": false,
+  "log_level": "info",
+  "exe": "",
+  "db_path": "",
+  "check_socks5": "127.0.0.1:10808",
+  "check_timeout": 20
+}

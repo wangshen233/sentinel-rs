@@ -38,9 +38,10 @@ fn run() -> Result<()> {
         }
         "mint" => cmd_mint(rest),
         "register" => cmd_register(rest),
+        "email-pool" | "mail-pool" | "pool" => cmd_email_pool(rest),
         other => {
             print_help();
-            bail!("未知子命令: {other:?}（可选：mint / register / help）")
+            bail!("未知子命令: {other:?}（可选：mint / register / email-pool / help）")
         }
     }
 }
@@ -87,8 +88,17 @@ fn cmd_mint(argv: &[String]) -> Result<()> {
         }
     }
 
-    let text = std::fs::read_to_string(&file)
-        .with_context(|| format!("读取 challenge 文件失败: {file}"))?;
+    // 默认文件名允许在仓库根里找（从任意 cwd 运行也能跑）
+    let text = match std::fs::read_to_string(&file) {
+        Ok(text) => text,
+        Err(err) => match sentinel_rs::paths::find_repo_file(&file) {
+            Ok(path) => std::fs::read_to_string(&path)
+                .with_context(|| format!("读取 challenge 文件失败: {}", path.display()))?,
+            Err(_) => {
+                return Err(err).with_context(|| format!("读取 challenge 文件失败: {file}"));
+            }
+        },
+    };
     let blob: serde_json::Value =
         serde_json::from_str(&text).with_context(|| format!("{file} 不是合法 JSON"))?;
 
@@ -160,7 +170,7 @@ fn cmd_mint(argv: &[String]) -> Result<()> {
     }
 
     if run_vm {
-        let ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36";
+        let ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36";
         let window = sentinel_rs::env::build_window(ua, "ja-JP", 1366, 768);
         let mut machine = Vm::new(window);
         match machine.run_program(program, &p) {
@@ -260,10 +270,92 @@ fn load_program(encoded: &str, key: &str) -> Result<Vec<Vec<Value>>, String> {
     Ok(out)
 }
 
+// ─────────────────────────── email-pool ───────────────────────────
+
+/// `email-pool`：**只解析、不注册**。校验静态邮箱池每行 `email----code_url`，
+/// 打印前 `--limit` 条（默认 3）+ 文件行数 + 跳过行数（格式不对的行会带行号报错）。
+///
+/// 不联网、不写 `.used`、不建锁文件，所以可以随便跑。
+fn cmd_email_pool(argv: &[String]) -> Result<()> {
+    let _ = dotenvy::dotenv();
+
+    let mut file: Option<String> = None;
+    let mut limit: usize = 3;
+    let mut iter = argv.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--file" | "-f" => {
+                file = Some(iter.next().context("--file 需要一个路径参数")?.to_string());
+            }
+            "--limit" => {
+                let raw = iter.next().context("--limit 需要一个数字")?;
+                limit = raw
+                    .parse()
+                    .with_context(|| format!("--limit 解析失败: {raw:?}"))?;
+            }
+            "-h" | "--help" => {
+                print_help();
+                return Ok(());
+            }
+            other => bail!("email-pool 未识别的参数: {other:?}"),
+        }
+    }
+
+    let path = file
+        .or_else(|| std::env::var(flow::email::ENV_EMAIL_FILE).ok())
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .context(format!(
+            "缺少邮箱池文件：用 --file <PATH> 或设置 {}",
+            flow::email::ENV_EMAIL_FILE
+        ))?;
+    let allow_insecure = flow::email::allow_insecure_from_env();
+    let pool = flow::email::StaticEmailPool::new_with_insecure(&path, allow_insecure);
+    let scan = pool.scan().context("解析静态邮箱池失败")?;
+
+    println!("== 静态邮箱池解析（只解析，不注册）==");
+    println!("  文件      : {}", scan.path.display());
+    println!("  文件行数  : {}", scan.file_lines);
+    println!("  有效条目  : {}", scan.entries.len());
+    println!("  跳过行数  : {}", scan.skipped_count());
+    println!("  已用(used): {}", scan.used_entries);
+    println!(
+        "  明文 http : {}",
+        if allow_insecure {
+            "已放行（REG_MAIL_ALLOW_INSECURE=1）"
+        } else {
+            "拒绝（未开启 REG_MAIL_ALLOW_INSECURE）"
+        }
+    );
+
+    for (lineno, reason) in scan.skipped.iter().take(limit) {
+        println!("  ! 第 {lineno} 行格式不对，已跳过：{reason}");
+    }
+    if scan.skipped_count() > limit {
+        println!(
+            "  … 另有 {} 行格式不对（用 --limit 调整打印条数）",
+            scan.skipped_count() - limit
+        );
+    }
+
+    println!("-- 前 {} 条解析结果 --", limit.min(scan.entries.len()));
+    for (i, mailbox) in scan.entries.iter().take(limit).enumerate() {
+        println!("  [{}] {}", i + 1, mailbox.email);
+        println!("      code_url = {}", mailbox.code_url);
+    }
+    if scan.entries.len() > limit {
+        println!("  …（共 {} 条有效邮箱）", scan.entries.len());
+    }
+    Ok(())
+}
+
 // ─────────────────────────── register ───────────────────────────
 
 fn cmd_register(argv: &[String]) -> Result<()> {
     let _ = dotenvy::dotenv();
+    // 先装日志：配置解析阶段就可能打印「明文 http」告警（REG_MAIL_ALLOW_INSECURE），
+    // 晚于 from_env 初始化会把那条 WARN 吞掉。
+    init_tracing();
 
     let mut cfg = RegisterConfig::from_env().context("读取注册配置失败")?;
     let mut concurrency: usize = 1;
@@ -287,7 +379,26 @@ fn cmd_register(argv: &[String]) -> Result<()> {
             "--proxy" => {
                 let raw = iter.next().context("--proxy 需要一个地址")?.to_string();
                 flow::http::normalize_proxy_url(&raw)?;
+                // `--proxy` 优先于 `--proxy-file`（本地 10808 → 上游动态的链式场景）
                 cfg.proxy = Some(raw);
+            }
+            "--proxy-file" => {
+                let raw = iter.next().context("--proxy-file 需要一个路径")?;
+                cfg.proxy_pool = Some(
+                    flow::http::ProxyPool::load(&raw)
+                        .with_context(|| format!("加载代理清单失败: {raw}"))?,
+                );
+            }
+            "--email-file" => {
+                let raw = iter.next().context("--email-file 需要一个路径")?;
+                let path = std::path::PathBuf::from(&raw);
+                if !path.exists() {
+                    bail!("--email-file 指向的文件不存在: {raw}");
+                }
+                cfg.static_email_pool = Some(flow::email::StaticEmailPool::new_with_insecure(
+                    path,
+                    cfg.mail_allow_insecure,
+                ));
             }
             "--2fa" => cfg.enable_2fa = true,
             "--concurrency" | "-c" => {
@@ -315,31 +426,51 @@ fn cmd_register(argv: &[String]) -> Result<()> {
         }
     }
 
-    init_tracing();
-
     // 单账号：先把本次要用的设备指纹定下来，配置里打印的就是这次真正使用的那一套。
     // 多账号（-n > 1）留给 register_once 逐账号生成，避免 N 个号共用一张画像。
+    //
+    // 顺序与 Python `_probe_country_before_fingerprint` 一致：先探测出口国家，
+    // 再按该国画像生成指纹。dry-run 承诺"不联网"，所以只在真实链路里探测。
     if cfg.fingerprint.is_none() && cfg.count == 1 {
+        if cfg.fp_country.is_none() && !cfg.dry_run && !cfg.has_ua_override() {
+            let proxy = cfg.proxy_for_account(0);
+            cfg.account_index = 0;
+            if let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                cfg.fp_country = rt.block_on(flow::probe_exit_country_if(
+                    flow::geo_probe_enabled(),
+                    proxy.as_deref(),
+                ));
+            }
+        }
         cfg.fingerprint = cfg.resolve_fingerprint();
     }
 
     println!("== 注册配置 ==");
     println!("  模式      : {}", if cfg.dry_run { "dry-run（不联网）" } else { "LIVE（真实联网注册）" });
     println!("  数量      : {}", cfg.count);
-    println!("  代理      : {}", cfg.proxy.as_deref().unwrap_or("<直连>"));
-    println!(
-        "  邮箱 API  : {}",
-        cfg.email_api
-            .as_ref()
-            .map(|api| api.base_url.as_str())
-            .unwrap_or("<未配置：REG_MAIL_API_BASE_URL>")
-    );
+    match (&cfg.proxy, &cfg.proxy_pool) {
+        (Some(proxy), _) => println!("  代理      : {proxy}（--proxy / SENTINEL_PROXY 优先）"),
+        (None, Some(pool)) => println!(
+            "  代理      : 清单轮换 {} 条（{}），第 N 个账号用第 N % {} 条",
+            pool.len(),
+            pool.path().display(),
+            pool.len()
+        ),
+        (None, None) => println!("  代理      : <直连>"),
+    }
+    println!("  邮箱来源  : {}", cfg.mailbox_source());
     println!("  2FA       : {}", if cfg.enable_2fa { "enroll+activate" } else { "关闭" });
     println!("  数据库    : {}", cfg.db_path.display());
     println!("  取码超时  : {}s（间隔 {}s）", cfg.otp_max_wait_secs, cfg.otp_poll_interval_secs);
     println!("  指纹      : {}", fingerprint_line(&cfg));
 
-    cfg.require_live_prerequisites()?;
+    // preflight 不领邮箱 / 不注册，所以不要求邮箱来源；只有真实注册才强制。
+    if !cfg.preflight {
+        cfg.require_live_prerequisites()?;
+    }
 
     if cfg.preflight {
         let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -374,8 +505,10 @@ fn cmd_register(argv: &[String]) -> Result<()> {
                 let batch = (cfg.count - done).min(concurrency);
                 let mut set: tokio::task::JoinSet<anyhow::Result<flow::RegistrationOutcome>> =
                     tokio::task::JoinSet::new();
-                for _ in 0..batch {
-                    let c = cfg.clone();
+                for i in 0..batch {
+                    let mut c = cfg.clone();
+                    // 账号下标：决定代理清单取第几条（并发下每任务独立一份配置）
+                    c.account_index = done + i;
                     set.spawn(async move { flow::register_once(&c).await });
                 }
                 for _ in 0..batch {
@@ -410,6 +543,8 @@ fn cmd_register(argv: &[String]) -> Result<()> {
 
     for index in 1..=cfg.count {
         println!("\n-- [{index}/{}] --", cfg.count);
+        // 账号下标（0 起）：同一份配置跑 N 次时，代理按这个下标轮换
+        cfg.account_index = index - 1;
         match runtime.block_on(flow::register_once(&cfg)) {
             Ok(outcome) => {
                 ok += 1;
@@ -488,6 +623,7 @@ fn print_help() {
 命令:
   mint        解码 challenge，生成 sentinel token（可选同时生成 SO token）
   register    跑注册流程；默认 dry-run，只打印计划（含真实 sentinel 步骤），不联网
+  email-pool  只解析静态邮箱池（不注册）：打印前 N 条 + 总行数 + 跳过行数
   help        显示本帮助（等价 --help / -h）
 
 全局:
@@ -502,20 +638,32 @@ mint 选项:
   --so            额外生成 SO token（openai-sentinel-so-token 载荷）
   --run-vm        解码后额外用内置 VM 跑一遍 dx（打印 steps / t_len）
 
+email-pool 选项:
+  --file, -f <PATH>  邮箱池文件（默认取 REG_MAIL_EMAIL_FILE），每行 email----code_url
+  --limit <N>        打印前 N 条解析结果（默认 3）
+
 register 选项:
   -n, --count <N> 注册数量（默认取 SENTINEL_COUNT，缺省 1）
   --db <PATH>     SQLite 路径（默认 data/sentinel-rs.db）
-  --proxy <URL>   代理，支持 host:port 或 http://user:pass@host:port
+  --proxy <URL>   单个代理（host:port 或 http://user:pass@host:port），优先于 --proxy-file
+  --proxy-file <PATH>
+                  代理清单，每行 host:port:user:pass；第 N 个账号用第 N % 清单条数 条
+  --email-file <PATH>
+                  静态邮箱池，每行 email----code_url（不调 POST /mailboxes）；
+                  已用过的写进 <PATH>.used，下次自动跳过
   --2fa           注册后 enroll+activate TOTP
   --dry-run       只构造请求计划（默认行为）
   --preflight     只验证 authorize 会话（warmup → signin → authorize init），
                   不领邮箱、不注册、不发码；用来确认 live 链路状态是否正常
-  --live          真实联网注册（危险：会真的建号，需自备邮箱 API 与 sentinel token 源）
+  --live          真实联网注册（危险：会真的建号，需自备邮箱与 sentinel token 源）
 
 环境变量（.env 亦可）:
-  SENTINEL_PROXY / HTTPS_PROXY / ALL_PROXY   代理
+  SENTINEL_PROXY / HTTPS_PROXY / ALL_PROXY   单个代理（优先于代理清单）
+  SENTINEL_PROXY_FILE                        代理清单（每行 host:port:user:pass）
+  REG_MAIL_EMAIL_FILE                        静态邮箱池（每行 email----code_url，优先）
   REG_MAIL_API_BASE_URL / REG_MAIL_API_TOKEN  邮箱取码 API（token 可选，见 README）
-  REG_MAIL_ALLOW_INSECURE                     1 放行回环 http://（本地自建 / mock）
+  REG_MAIL_ALLOW_INSECURE                     1 放行任意 host 的明文 http://（code_url / base_url；
+                                              仅限可信内网/自建服务，未开启时明文 http 一律拒绝）
   SENTINEL_COUNT / REGISTER_COUNT            默认数量
   SENTINEL_DB_PATH                           默认数据库路径
   SENTINEL_ENABLE_2FA                        1/true 开启 2FA
@@ -523,7 +671,7 @@ register 选项:
   SENTINEL_LIVE_REGISTER                     1 才允许真实联网注册
   SENTINEL_USER_AGENT / SENTINEL_ACCEPT_LANGUAGE  显式指定 UA / 语言（给定时不做随机指纹）
   SENTINEL_FP_SEED                           设备指纹 seed（同 seed 可复现整套指纹）
-  SENTINEL_FP_COUNTRY                        强制指纹区域（JP / GB / DE …）
+  SENTINEL_FP_COUNTRY                        强制指纹区域（JP / GB / DE …，共 50 国）\n  SENTINEL_FP_GEO_PROBE                      0 关闭「出口 IP 国家 → 指纹时区/语言」探测（默认开启）
   SENTINEL_LOG                               trace/debug/info/warn/error/off
 
 示例:
@@ -531,13 +679,15 @@ register 选项:
   sentinel-rs mint --file sample_challenge.json
   sentinel-rs mint --file sample_challenge.json --so
   sentinel-rs mint --file sample_challenge.json --so --flow email_otp_validate
+  sentinel-rs email-pool --file mails.txt --limit 3
   sentinel-rs register -n 1
   sentinel-rs register -n 3 --2fa --dry-run
 
 注意:
   * register 默认 dry-run：不联网、不发邮件、不写真实凭证。
-  * --live 需要邮箱取码 API 配置（REG_MAIL_API_BASE_URL，契约见 README）；\
- sentinel token 由 src/flow/sentinel.rs 生成。
+  * --live 需要邮箱来源：--email-file / REG_MAIL_EMAIL_FILE（静态池）或 \
+REG_MAIL_API_BASE_URL（现领邮箱 API，契约见 README）；sentinel token 由 \
+src/flow/sentinel.rs 生成。
   * SO token 依赖 mint_so（src/so.rs），未就绪时 mint --so 只打印提示并 exit 0。
 "#
     );

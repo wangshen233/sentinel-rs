@@ -4,6 +4,7 @@ pub mod env;
 pub mod fingerprint;
 pub mod flow;
 pub mod mint;
+pub mod paths;
 pub mod so;
 pub mod token;
 pub mod value;

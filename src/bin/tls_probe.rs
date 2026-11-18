@@ -19,6 +19,9 @@ const DEFAULT_URL: &str = "https://tls.browserleaks.com/json";
 async fn main() -> Result<()> {
     let mut url = DEFAULT_URL.to_string();
     let mut proxy: Option<String> = std::env::var("TURB_WREQ_PROXY").ok();
+    // 空串 = 用 emulation profile 自带的那条 Chrome UA；给值就按它发，
+    // 方便验证「UA 声称的版本 == TLS 档位」这条硬规则。
+    let mut user_agent = String::new();
 
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let mut iter = argv.iter();
@@ -26,14 +29,15 @@ async fn main() -> Result<()> {
         match arg.as_str() {
             "--url" => url = iter.next().cloned().unwrap_or_default(),
             "--proxy" => proxy = iter.next().cloned(),
+            "--ua" => user_agent = iter.next().cloned().unwrap_or_default(),
             "-h" | "--help" => {
                 println!(
-                    "用法: tls_probe [--url URL] [--proxy PROXY]\n\
-                     环境变量: TURB_WREQ_EMULATION（默认 Chrome149）/ TURB_WREQ_PROXY"
+                    "用法: tls_probe [--url URL] [--proxy PROXY] [--ua USER_AGENT]\n\
+                     环境变量: TURB_WREQ_EMULATION（默认 Chrome146）/ TURB_WREQ_PROXY"
                 );
                 return Ok(());
             }
-            other => bail!("未识别的参数: {other:?}（可用 --url / --proxy）"),
+            other => bail!("未识别的参数: {other:?}（可用 --url / --proxy / --ua）"),
         }
     }
     if url.is_empty() {
@@ -41,9 +45,17 @@ async fn main() -> Result<()> {
     }
 
     // UA 传空串 → 用 emulation profile 自带的那条 Chrome UA。
-    let client = Client::build("", proxy.as_deref(), http::RetryPolicy::default())?;
+    let client = Client::build(&user_agent, proxy.as_deref(), http::RetryPolicy::default())?;
     println!("emulation : {:?}", client.emulation);
     println!("proxy     : {}", proxy.as_deref().unwrap_or("<直连>"));
+    println!(
+        "ua        : {}",
+        if user_agent.is_empty() {
+            "<profile 默认>"
+        } else {
+            user_agent.as_str()
+        }
+    );
     println!("url       : {url}");
 
     let resp = client.execute(&RequestSpec::get("tls.probe", url)).await?;

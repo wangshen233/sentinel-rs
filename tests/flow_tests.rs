@@ -303,7 +303,7 @@ fn email_config_from_env_values() {
 }
 
 #[test]
-fn email_allows_insecure_only_for_loopback_with_opt_in() {
+fn email_allows_insecure_only_with_opt_in() {
     // http:// + 未开逃生门 → 拒绝，并点名叫用户设 REG_MAIL_ALLOW_INSECURE
     let err = EmailApiConfig::from_lookup(&lookup_from(&[(
         "REG_MAIL_API_BASE_URL",
@@ -325,18 +325,55 @@ fn email_allows_insecure_only_for_loopback_with_opt_in() {
         "http://127.0.0.1:8899/api/v1/mailboxes"
     );
 
-    // http:// + 逃生门 + 非回环 → 仍然拒绝
-    let err = EmailApiConfig::from_lookup(&lookup_from(&[
-        ("REG_MAIL_API_BASE_URL", "http://mail.example.invalid"),
+    // http:// + 逃生门 + **非回环**（自建 http://IP:PORT）→ 也放行
+    let remote = EmailApiConfig::from_lookup(&lookup_from(&[
+        ("REG_MAIL_API_BASE_URL", "http://198.51.100.7:28012/api/plus/v4"),
         ("REG_MAIL_ALLOW_INSECURE", "1"),
     ]))
+    .unwrap()
+    .unwrap();
+    assert!(remote.allow_insecure);
+    assert_eq!(
+        remote.endpoint("getcode"),
+        "http://198.51.100.7:28012/api/plus/v4/getcode"
+    );
+
+    // 非回环 http:// 未开逃生门 → 仍然拒绝（默认安全，点名开关）
+    let err = EmailApiConfig::from_lookup(&lookup_from(&[(
+        "REG_MAIL_API_BASE_URL",
+        "http://198.51.100.7:28012/api/plus/v4",
+    )]))
     .unwrap_err();
-    assert!(format!("{err:#}").contains("回环"), "{err:#}");
+    assert!(format!("{err:#}").contains("REG_MAIL_ALLOW_INSECURE"), "{err:#}");
+
+    // 逃生门开关的解析（大小写 / 多种真值）
+    for raw in ["1", "true", "YES", "on"] {
+        assert!(
+            email::allow_insecure_from_lookup(&lookup_from(&[(
+                "REG_MAIL_ALLOW_INSECURE",
+                raw
+            )])),
+            "{raw} 应视为开启"
+        );
+    }
+    for raw in ["0", "false", "off", "no", ""] {
+        assert!(
+            !email::allow_insecure_from_lookup(&lookup_from(&[(
+                "REG_MAIL_ALLOW_INSECURE",
+                raw
+            )])),
+            "{raw} 应视为关闭"
+        );
+    }
 
     assert!(email::is_loopback_url("http://127.0.0.1:8899/x"));
     assert!(email::is_loopback_url("http://localhost:8899/x"));
     assert!(email::is_loopback_url("http://[::1]:8899/x"));
     assert!(!email::is_loopback_url("http://mail.example.invalid/x"));
+    assert_eq!(
+        email::url_host("http://mail.example.com:8080/api/x?id=a@b").as_deref(),
+        Some("203.0.113.7")
+    );
 }
 
 #[test]
@@ -674,4 +711,621 @@ fn missing_sentinel_source_reports_todo() {
     let msg = format!("{err:#}");
     assert!(msg.contains("TODO(mint)"), "{msg}");
     assert!(msg.contains("authorize_continue"), "{msg}");
+}
+
+// ─────────────────────── 静态邮箱池 / 代理清单 ───────────────────────
+
+/// 建一个独立的临时目录（每个测试一套，避免互相踩）。
+fn temp_dir(tag: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!(
+        "sentinel-rs-test-{tag}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+#[test]
+fn static_email_pool_parses_lines() {
+    let ok = email::parse_static_email_line(
+        "user@example.invalid----https://mail.example.invalid/share/v1/code?link=abc&token=def",
+    )
+    .unwrap()
+    .expect("应解析出一行");
+    assert_eq!(ok.email, "user@example.invalid");
+    assert_eq!(
+        ok.code_url,
+        "https://mail.example.invalid/share/v1/code?link=abc&token=def"
+    );
+    assert_eq!(ok.expires_at, None);
+
+    // 空行 / 注释行跳过
+    assert!(email::parse_static_email_line("   ").unwrap().is_none());
+    assert!(email::parse_static_email_line("# comment").unwrap().is_none());
+
+    // 格式不对要报错（而不是静默当一个空邮箱）
+    assert!(email::parse_static_email_line("no-separator").is_err());
+    assert!(email::parse_static_email_line("bad@x----https://ok.invalid").is_ok());
+    assert!(email::parse_static_email_line("noat----https://ok.invalid").is_err());
+    assert!(email::parse_static_email_line("a@b----ftp://nope").is_err());
+}
+
+#[test]
+fn static_email_pool_accepts_http_only_with_opt_in() {
+    let line = "a@example.invalid----http://198.51.100.7:28012/api/plus/v4/getcode?id=a@example.invalid";
+
+    // 默认拒绝明文 http，并点名叫用户开 REG_MAIL_ALLOW_INSECURE
+    let err = email::parse_static_email_line(line).unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("REG_MAIL_ALLOW_INSECURE") && msg.contains("https://"),
+        "{msg}"
+    );
+
+    // 开关打开 → 放行任意 host（含 http://IP:PORT）
+    let ok = email::parse_static_email_line_with(line, true)
+        .unwrap()
+        .expect("应解析出一行");
+    assert_eq!(ok.email, "a@example.invalid");
+    assert_eq!(
+        ok.code_url,
+        "http://198.51.100.7:28012/api/plus/v4/getcode?id=a@example.invalid"
+    );
+
+    // https 在两种开关下都放行
+    assert!(email::parse_static_email_line_with(
+        "a@example.invalid----https://mail.example.invalid/c",
+        false
+    )
+    .is_ok());
+    assert!(email::parse_static_email_line_with(
+        "a@example.invalid----https://mail.example.invalid/c",
+        true
+    )
+    .is_ok());
+}
+
+#[test]
+fn static_email_pool_skips_bad_lines_with_line_numbers() {
+    let dir = temp_dir("email-pool-skip");
+    let pool_path = dir.join("mails.txt");
+    let text = "# header\n\
+                a1@example.invalid----https://mail.example.invalid/c?link=1\n\
+                \n\
+                broken-line-without-separator\n\
+                noat----https://mail.example.invalid/c?link=2\n\
+                a2@example.invalid----ftp://nope\n\
+                a3@example.invalid----http://198.51.100.7:28012/api/getcode?id=a3@example.invalid\n\
+                a4@example.invalid----https://mail.example.invalid/c?link=4\n";
+    std::fs::write(&pool_path, text).unwrap();
+
+    // 默认（明文 http 拒绝）：只有 2 条 https 合法，4 行被跳过
+    let pool = email::StaticEmailPool::new(&pool_path);
+    assert!(!pool.allow_insecure());
+    let scan = pool.scan().unwrap();
+    assert_eq!(scan.file_lines, 8);
+    assert_eq!(scan.skipped_count(), 4);
+    assert_eq!(
+        scan.entries.iter().map(|m| m.email.as_str()).collect::<Vec<_>>(),
+        vec!["a1@example.invalid", "a4@example.invalid"]
+    );
+    // 跳过的行号 + 原因都要在（不能静默）
+    let skipped_lines: Vec<usize> = scan.skipped.iter().map(|(n, _)| *n).collect();
+    assert_eq!(skipped_lines, vec![4, 5, 6, 7]);
+    assert!(scan.skipped.iter().all(|(_, reason)| !reason.is_empty()));
+
+    // 开开关：http 那一行也变成合法（3 条），其余 3 行仍然报错跳过
+    let insecure = email::StaticEmailPool::new_with_insecure(&pool_path, true);
+    let scan2 = insecure.scan().unwrap();
+    assert_eq!(scan2.entries.len(), 3);
+    assert_eq!(scan2.skipped_count(), 3);
+    assert_eq!(
+        scan2.skipped.iter().map(|(n, _)| *n).collect::<Vec<_>>(),
+        vec![4, 5, 6]
+    );
+
+    // `next()` 遇到坏行是"告警 + 跳过"，不是整批失败
+    let first = pool.next().unwrap();
+    assert_eq!(first.email, "a1@example.invalid");
+    let second = pool.next().unwrap();
+    assert_eq!(second.email, "a4@example.invalid", "坏行应被跳过而不是中止");
+
+    // 只解析不取用：scan 不写 .used、不建锁文件
+    assert!(!pool.lock_path().exists());
+    let scan3 = pool.scan().unwrap();
+    assert_eq!(scan3.used_entries, 2, "两条已取用的应被标记");
+}
+
+#[test]
+fn static_email_pool_strips_utf8_bom() {
+    let dir = temp_dir("email-pool-bom");
+    let path = dir.join("mails.txt");
+    std::fs::write(
+        &path,
+        "\u{feff}u1@example.invalid----https://m.example.invalid/c?x=1\n\
+         u2@example.invalid----https://m.example.invalid/c?x=2\n",
+    )
+    .unwrap();
+    let scan = email::StaticEmailPool::new(&path).scan().unwrap();
+    assert_eq!(scan.skipped_count(), 0);
+    assert_eq!(
+        scan.entries.iter().map(|m| m.email.as_str()).collect::<Vec<_>>(),
+        vec!["u1@example.invalid", "u2@example.invalid"],
+        "第一行的 UTF-8 BOM 必须被剥掉"
+    );
+}
+
+#[test]
+fn static_email_pool_used_file_is_per_path() {
+    let dir = temp_dir("email-pool-perpath");
+    let a = dir.join("a.txt");
+    let b = dir.join("b.txt");
+    std::fs::write(&a, "u1@example.invalid----https://m.example.invalid/c?x=1\n").unwrap();
+    std::fs::write(&b, "u1@example.invalid----https://m.example.invalid/c?x=1\n").unwrap();
+
+    let pa = email::StaticEmailPool::new(&a);
+    let pb = email::StaticEmailPool::new(&b);
+    assert_ne!(pa.used_path(), pb.used_path(), "不同清单的 .used 必须分开");
+
+    assert_eq!(pa.next().unwrap().email, "u1@example.invalid");
+    // 同一邮箱在另一个清单里仍然可用（互不污染）
+    assert_eq!(pb.next().unwrap().email, "u1@example.invalid");
+    // 各自用尽
+    assert!(pa.next().is_err());
+    assert!(pb.next().is_err());
+    assert!(std::fs::read_to_string(pa.used_path()).unwrap().contains("u1@example.invalid"));
+    assert!(std::fs::read_to_string(pb.used_path()).unwrap().contains("u1@example.invalid"));
+}
+
+#[test]
+fn static_email_pool_uses_each_line_once_and_tracks_used_file() {
+    let dir = temp_dir("email-pool");
+    let pool_path = dir.join("mails.txt");
+    std::fs::write(
+        &pool_path,
+        "# header\n\
+         a1@example.invalid----https://mail.example.invalid/c?link=1&token=a\n\
+         \n\
+         a2@example.invalid----https://mail.example.invalid/c?link=2&token=b\n\
+         a3@example.invalid----https://mail.example.invalid/c?link=3&token=c\n",
+    )
+    .unwrap();
+
+    let pool = email::StaticEmailPool::new(&pool_path);
+    assert_eq!(pool.used_path(), dir.join("mails.txt.used"));
+    assert_eq!(pool.lock_path(), dir.join("mails.txt.lock"));
+
+    let first = pool.next().unwrap();
+    assert_eq!(first.email, "a1@example.invalid");
+    let second = pool.next().unwrap();
+    assert_eq!(second.email, "a2@example.invalid");
+
+    // used 文件按行追加
+    let used = std::fs::read_to_string(pool.used_path()).unwrap();
+    assert_eq!(
+        used.lines().collect::<Vec<_>>(),
+        vec!["a1@example.invalid", "a2@example.invalid"]
+    );
+
+    // 锁文件用完即删
+    assert!(!pool.lock_path().exists(), "锁文件应已释放");
+
+    // 新实例（模拟重跑）跳过已用过的两行
+    let pool2 = email::StaticEmailPool::new(&pool_path);
+    let third = pool2.next().unwrap();
+    assert_eq!(third.email, "a3@example.invalid");
+
+    // 用尽后报错，而不是复用
+    let err = pool2.next().unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(msg.contains("静态邮箱池已用尽"), "{msg}");
+}
+
+#[test]
+fn static_email_pool_never_hands_out_the_same_line_twice() {
+    let dir = temp_dir("email-concurrent");
+    let pool_path = dir.join("mails.txt");
+    let mut text = String::new();
+    for i in 0..8 {
+        text.push_str(&format!(
+            "u{i}@example.invalid----https://mail.example.invalid/c?link={i}\n"
+        ));
+    }
+    std::fs::write(&pool_path, text).unwrap();
+
+    // 8 个线程同时抢：每行只能被取一次
+    let mut handles = Vec::new();
+    for _ in 0..8 {
+        let path = pool_path.clone();
+        handles.push(std::thread::spawn(move || {
+            email::StaticEmailPool::new(path).next().map(|m| m.email)
+        }));
+    }
+    let mut got: Vec<String> = handles
+        .into_iter()
+        .map(|h| h.join().unwrap().expect("并发下每线程都应拿到一个邮箱"))
+        .collect();
+    got.sort();
+    got.dedup();
+    assert_eq!(got.len(), 8, "8 个线程必须拿到 8 个不同邮箱: {got:?}");
+}
+
+#[test]
+fn proxy_pool_parses_proxy_lines_and_rotates() {
+    // 代理服务商 风格：host:port:user:pass
+    let url = http::ProxyPool::parse_line("proxy.example.com:8080:user-abc:pass-word")
+        .unwrap()
+        .expect("应解析出一行");
+    assert_eq!(url, "http://user-abc:pass-word@proxy.example.com:8080");
+
+    // 无鉴权 / 带 scheme / 注释 / 非法端口
+    assert_eq!(
+        http::ProxyPool::parse_line("10.0.0.1:8080").unwrap().unwrap(),
+        "http://10.0.0.1:8080"
+    );
+    assert_eq!(
+        http::ProxyPool::parse_line("socks5h://127.0.0.1:10808")
+            .unwrap()
+            .unwrap(),
+        "socks5h://127.0.0.1:10808"
+    );
+    assert!(http::ProxyPool::parse_line("").unwrap().is_none());
+    assert!(http::ProxyPool::parse_line("# x").unwrap().is_none());
+    assert!(http::ProxyPool::parse_line("host:notaport").is_err());
+    assert!(http::ProxyPool::parse_line("hostonly").is_err());
+
+    // userinfo 里的特殊字符要 percent-encode，否则 URL 会解析歪
+    let encoded = http::ProxyPool::parse_line("h:1:u@x:p@ss").unwrap().unwrap();
+    assert_eq!(encoded, "http://u%40x:p%40ss@h:1");
+
+    // 文件 + 轮换：第 N 个账号用第 N % len 条
+    let dir = temp_dir("proxy-pool");
+    let path = dir.join("proxies.txt");
+    std::fs::write(
+        &path,
+        "h1:1111:u1:p1\n\
+         h2:2222:u2:p2\n\
+         h3:3333:u3:p3\n",
+    )
+    .unwrap();
+    let pool = http::ProxyPool::load(&path).unwrap();
+    assert_eq!(pool.len(), 3);
+    assert_eq!(pool.pick(0).unwrap(), "http://u1:p1@h1:1111");
+    assert_eq!(pool.pick(1).unwrap(), "http://u2:p2@h2:2222");
+    assert_eq!(pool.pick(2).unwrap(), "http://u3:p3@h3:3333");
+    assert_eq!(pool.pick(3).unwrap(), "http://u1:p1@h1:1111", "取模轮换");
+    assert_eq!(pool.pick(4).unwrap(), "http://u2:p2@h2:2222");
+}
+
+#[test]
+fn register_config_prefers_static_mail_pool_and_proxy_rotation() {
+    let dir = temp_dir("config-pool");
+    let mail = dir.join("mails.txt");
+    std::fs::write(
+        &mail,
+        "s1@example.invalid----https://mail.example.invalid/c?link=1\n",
+    )
+    .unwrap();
+    let proxies = dir.join("proxies.txt");
+    std::fs::write(&proxies, "h1:1111:u1:p1\nh2:2222:u2:p2\n").unwrap();
+
+    let cfg = RegisterConfig::from_lookup(lookup_from(&[
+        ("REG_MAIL_EMAIL_FILE", mail.to_str().unwrap()),
+        ("SENTINEL_PROXY_FILE", proxies.to_str().unwrap()),
+        ("SENTINEL_LIVE_REGISTER", "1"),
+    ]))
+    .unwrap();
+
+    // 静态池优先，且不要求 REG_MAIL_API_BASE_URL
+    assert!(cfg.static_email_pool.is_some());
+    assert!(cfg.email_api.is_none());
+    assert!(cfg.mailbox_source().contains("静态池"));
+    cfg.require_live_prerequisites().unwrap();
+
+    // 代理按账号轮换；`--proxy` 仍然优先
+    assert_eq!(
+        cfg.proxy_for_account(0).as_deref(),
+        Some("http://u1:p1@h1:1111")
+    );
+    assert_eq!(
+        cfg.proxy_for_account(1).as_deref(),
+        Some("http://u2:p2@h2:2222")
+    );
+    assert_eq!(
+        cfg.proxy_for_account(2).as_deref(),
+        Some("http://u1:p1@h1:1111")
+    );
+    let mut with_proxy = cfg.clone();
+    with_proxy.proxy = Some("socks5h://127.0.0.1:10808".to_string());
+    assert_eq!(
+        with_proxy.proxy_for_account(1).as_deref(),
+        Some("socks5h://127.0.0.1:10808"),
+        "单代理必须优先于清单"
+    );
+
+    // 静态池与 API 同时设置时静态池优先（互斥语义）
+    let both = RegisterConfig::from_lookup(lookup_from(&[
+        ("REG_MAIL_EMAIL_FILE", mail.to_str().unwrap()),
+        ("REG_MAIL_API_BASE_URL", "https://mail.example.invalid"),
+        ("SENTINEL_LIVE_REGISTER", "1"),
+    ]))
+    .unwrap();
+    assert!(both.static_email_pool.is_some());
+    assert!(both.mailbox_source().contains("静态池"));
+}
+
+#[test]
+fn otp_reads_json_code_pages() {
+    use std::collections::HashSet;
+
+    let body = r#"{"code":"746194","cursor":149362,"kind":"code+link","link":"https://chatgpt.com","mail_time":"2026-11-17 15:25:50","ok":true,"received_at":1794929150,"recipient":"a@example.invalid","sender":"chatgpt <x@example.invalid>","status":"received","subject":"Your temporary ChatGPT verification code"}"#;
+
+    let empty = HashSet::new();
+    // 新鲜（received_at 不早于请求开始 - 5s）
+    assert_eq!(
+        otp::select_code_from_json(body, Some(1_794_929_100), &empty).as_deref(),
+        Some("746194")
+    );
+    // 太旧（早于请求开始 5s 以上）→ 不是本次的码
+    assert_eq!(
+        otp::select_code_from_json(body, Some(1_794_930_000), &empty),
+        None
+    );
+    // baseline 里已有 → 不算新
+    let baseline: HashSet<String> = ["746194".to_string()].into_iter().collect();
+    assert_eq!(otp::select_code_from_json(body, None, &baseline), None);
+
+    // 嵌套 / 数字形态 / 毫秒时间戳也能读
+    let nested = r#"{"ok":true,"data":{"otp":746195,"received_at":1794929150000}}"#;
+    assert_eq!(
+        otp::select_code_from_json(nested, Some(1_794_929_100), &empty).as_deref(),
+        Some("746195")
+    );
+
+    // HTML 页面不会被误当成 JSON
+    assert_eq!(
+        otp::select_code_from_json("<html>123456</html>", None, &empty),
+        None
+    );
+    // 非法 JSON 不 panic
+    assert_eq!(otp::select_code_from_json("{\"code\":", None, &empty), None);
+}
+
+#[test]
+fn otp_treats_pending_json_as_no_code() {
+    use std::collections::HashSet;
+
+    let empty = HashSet::new();
+    // 实测形态：还没有验证码
+    let pending = r#"{"code":"no_code","message":"暂未收到验证码","retryable":true,"success":false}"#;
+    assert_eq!(
+        otp::select_code_from_json(pending, None, &empty),
+        None,
+        "no_code 不能被当成验证码"
+    );
+    assert_eq!(
+        otp::select_code_from_json(pending, Some(1_794_929_100), &empty),
+        None
+    );
+    let reason = otp::json_pending_reason(pending).expect("应识别为待机响应");
+    assert!(reason.contains("success=false"), "{reason}");
+
+    // success=false 时即使带了 6 位数字也不取（避免把上一轮的码当新码）
+    assert_eq!(
+        otp::select_code_from_json(r#"{"success":false,"code":"123456"}"#, None, &empty),
+        None
+    );
+    // 空 / null / 无 code 字段
+    for body in [
+        r#"{"code":null}"#,
+        r#"{"code":""}"#,
+        r#"{"message":"暂未收到验证码","retryable":true}"#,
+        r#"{"ok":false,"retryable":true}"#,
+    ] {
+        assert_eq!(otp::select_code_from_json(body, None, &empty), None, "{body}");
+        assert!(otp::json_pending_reason(body).is_some(), "{body}");
+    }
+
+    // 正常 6 位码 → 直接返回（且不算待机）
+    let body = r#"{"code":"123456","message":"已收到","success":true}"#;
+    assert_eq!(
+        otp::select_code_from_json(body, None, &empty).as_deref(),
+        Some("123456")
+    );
+    assert!(otp::json_pending_reason(body).is_none());
+
+    // 嵌套：data.code / result.code / 数字形态
+    assert_eq!(
+        otp::select_code_from_json(
+            r#"{"success":true,"data":{"code":"654321"}}"#,
+            None,
+            &empty
+        )
+        .as_deref(),
+        Some("654321")
+    );
+    assert_eq!(
+        otp::select_code_from_json(r#"{"result":{"code":"112233"}}"#, None, &empty).as_deref(),
+        Some("112233")
+    );
+    assert_eq!(
+        otp::select_code_from_json(r#"{"data":{"code":998877}}"#, None, &empty).as_deref(),
+        Some("998877")
+    );
+    // 嵌套里的 no_code 也不算码
+    assert_eq!(
+        otp::select_code_from_json(r#"{"data":{"code":"no_code"},"success":true}"#, None, &empty),
+        None
+    );
+    // 非 JSON 不误判
+    assert!(otp::json_pending_reason("<html>暂未收到验证码</html>").is_none());
+    assert!(!otp::looks_like_json("<html></html>"));
+    assert!(otp::looks_like_json(r#" {"code":"1"} "#));
+}
+
+// ─────────────────── 出口国家探测（Python _probe_country_before_fingerprint）───────────────────
+#[test]
+fn trace_country_is_parsed_from_loc_line() {
+    let trace = "fl=1f2abc\nh=cloudflare.com\nip=203.0.113.9\nts=1794929150.123\nvisit_scheme=https\nuag=curl\ncolo=SIN\nsliver=none\nhttp=http/2\nloc=IN\ntls=TLSv1.3\nsni=plaintext\nwarp=off\ngateway=off\nrbi=off\nkex=X25519\n";
+    assert_eq!(flow::parse_trace_country(trace).as_deref(), Some("IN"));
+
+    // 大小写归一 + 行内前后空白
+    assert_eq!(flow::parse_trace_country("loc=jp\n").as_deref(), Some("JP"));
+    assert_eq!(
+        flow::parse_trace_country("  loc=de  \n").as_deref(),
+        Some("DE")
+    );
+
+    // 取第一行 loc=（Python 也是遇到就 return）
+    assert_eq!(
+        flow::parse_trace_country("loc=US\nloc=JP\n").as_deref(),
+        Some("US")
+    );
+
+    // 非法 / 缺失
+    assert_eq!(flow::parse_trace_country(""), None);
+    assert_eq!(flow::parse_trace_country("no loc line here"), None);
+    assert_eq!(flow::parse_trace_country("loc=\n"), None);
+    assert_eq!(flow::parse_trace_country("loc=INDIA\n"), None);
+    assert_eq!(flow::parse_trace_country("ip=1.2.3.4\n"), None);
+    // Tor 的 loc=T1：Python 会原样返回，这里返回后由 country_profile 按未知国家兜底
+    assert_eq!(flow::parse_trace_country("loc=T1\n").as_deref(), Some("T1"));
+}
+
+#[test]
+fn geo_probe_switch_reads_env_like_python() {
+    // 默认开启
+    assert!(flow::geo_probe_enabled_from_lookup(&lookup_from(&[])));
+    // 各种关闭写法
+    for raw in ["0", "false", "FALSE", "off", "no"] {
+        assert!(
+            !flow::geo_probe_enabled_from_lookup(&lookup_from(&[("SENTINEL_FP_GEO_PROBE", raw)])),
+            "{raw} 应关闭探测"
+        );
+    }
+    // 其它值仍然开启
+    for raw in ["1", "true", "yes", "on", "anything"] {
+        assert!(
+            flow::geo_probe_enabled_from_lookup(&lookup_from(&[("SENTINEL_FP_GEO_PROBE", raw)])),
+            "{raw} 应保持开启"
+        );
+    }
+}
+
+#[test]
+fn geo_probe_disabled_sends_no_request() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let started = std::time::Instant::now();
+    // 指向一个必然连不上的地址：只要发了请求，耗时会明显上升
+    let got = runtime.block_on(flow::probe_exit_country_if(
+        false,
+        Some("socks5h://127.0.0.1:1"),
+    ));
+    assert_eq!(got, None);
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(2),
+        "关闭开关后不应发起任何网络请求（耗时 {:?}）",
+        started.elapsed()
+    );
+}
+
+#[test]
+fn geo_probe_failure_falls_back_to_default_profile() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    // 关闭端口 → 探测失败返回 None，不 panic
+    let country = runtime.block_on(flow::probe_exit_country_if(
+        true,
+        Some("http://127.0.0.1:1"),
+    ));
+    assert_eq!(country, None, "探测失败必须优雅返回 None");
+
+    // 退回默认画像（UTC + en-US），与 Python `_DEFAULT_COUNTRY_PROFILE` 一致
+    let fp = sentinel_rs::fingerprint::DeviceFingerprint::generate_for_country(
+        Some("geo-fallback"),
+        country.as_deref(),
+    );
+    assert_eq!(fp.timezone, "UTC");
+    assert_eq!(fp.lang, "en-US");
+    assert_eq!(fp.platform, "Win32");
+    assert!(
+        fp.user_agent
+            .contains(&format!("Chrome/{}", fp.browser_version)),
+        "UA 必须与 browser_version 同档: {}",
+        fp.user_agent
+    );
+    assert!(fp.version_consistency().is_ok(), "{:?}", fp.version_consistency());
+}
+
+#[test]
+fn fingerprint_follows_probed_country() {
+    // 探测到 IN → 指纹落在印度画像（Asia/Kolkata / en-IN）
+    let country = flow::parse_trace_country("loc=IN\n").expect("loc=IN");
+    let fp = sentinel_rs::fingerprint::DeviceFingerprint::generate_for_country(
+        Some("geo-seed"),
+        Some(&country),
+    );
+    assert_eq!(fp.country_code, "IN");
+    assert_eq!(fp.timezone, "Asia/Kolkata");
+    assert_eq!(fp.lang, "en-IN");
+    assert_eq!(fp.locale, "en-IN");
+    assert!(fp.lang_full.starts_with("en-IN"));
+    assert!(
+        fp.user_agent
+            .contains(&format!("Chrome/{}", fp.browser_version)),
+        "UA 必须与 browser_version 同档: {}",
+        fp.user_agent
+    );
+    assert_eq!(fp.platform, "Win32");
+
+    // 配置层面：fp_country 优先于环境里的空值
+    let mut cfg = RegisterConfig::default();
+    cfg.fp_country = Some("IN".to_string());
+    let resolved = cfg.resolve_fingerprint().expect("应生成指纹");
+    assert_eq!(resolved.timezone, "Asia/Kolkata");
+
+    // 显式国家优先于探测：SENTINEL_FP_COUNTRY 在 from_lookup 阶段就定死
+    let cfg = RegisterConfig::from_lookup(lookup_from(&[
+        ("SENTINEL_FP_COUNTRY", "jp"),
+        ("SENTINEL_FP_GEO_PROBE", "0"),
+    ]))
+    .unwrap();
+    assert_eq!(cfg.fp_country.as_deref(), Some("JP"));
+    let fp = cfg.resolve_fingerprint().expect("应生成指纹");
+    assert_eq!(fp.timezone, "Asia/Tokyo");
+    assert_eq!(fp.lang, "ja-JP");
+}
+
+// ─────────────────── 资源路径：运行期解析（不再编译期固化）───────────────────
+
+#[test]
+fn repo_asset_resolution_works_without_compile_time_path() {
+    use sentinel_rs::paths;
+
+    // 显式指定仓库根目录时必须能找到（这也是打包/搬家后的逃生门）
+    let root = paths::repo_root_candidates()
+        .into_iter()
+        .find(|p| p.join("sample_challenge.json").is_file())
+        .expect("测试环境里应能从某个候选根目录找到 sample_challenge.json");
+    std::env::set_var(paths::REPO_ROOT_ENV, &root);
+    let found = paths::find_repo_file("sample_challenge.json").expect("应找到 challenge");
+    assert!(found.is_file(), "{}", found.display());
+    let expected = paths::find_repo_file("tests/token_expected.json").expect("应找到 expected");
+    assert!(expected.is_file(), "{}", expected.display());
+    std::env::remove_var(paths::REPO_ROOT_ENV);
+
+    // 找不到时错误里要列出尝试过的路径（而不是 panic）
+    let err = paths::find_repo_file("definitely-not-here-xyz.json").unwrap_err();
+    assert!(err.contains("definitely-not-here-xyz.json"), "{err}");
+    assert!(err.contains("尝试过"), "{err}");
+    assert!(err.contains(paths::REPO_ROOT_ENV), "{err}");
 }

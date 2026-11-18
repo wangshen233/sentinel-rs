@@ -39,6 +39,28 @@ OpenAI 注册链路中 **Sentinel token** 的 Rust 重实现，加上一套可�
 > 普通 PowerShell 里直接 `cargo build` 会挂在 `btls-sys` 的 bindgen 或 `cl.exe` 上。
 > `build.ps1` 会自己 `call vcvars64.bat`、导入环境变量、设置 `LIBCLANG_PATH` 与 `PATH` 再跑 cargo。
 > 脚本里 `$VcVars` / `$LlvmDir` 两个路径是按常见安装位置写的，装到别处就改这两行。
+>
+> ### 为什么还要一个 ASCII 目录联接
+>
+> **nasm 打不开非 ASCII 路径**。BoringSSL 的汇编模块（`aes-gcm-avx2-x86_64-win.asm`
+> 等）由 nasm 汇编，而 nasm 按 ANSI 打开文件 —— 项目目录里只要有中文（例如本仓库
+> 就在桌面的 `新建文件夹 (4)` 下），cmake 的 asm 步骤直接失败：
+>
+> ```text
+> error MSB3721: 命令 "nasm.exe -o ...aes-gcm-avx2-x86_64-win.obj ..." 已退出，返回代码为 1
+> nasm: fatal: unable to open input file `C:\Users\...\新建文件夹 (4)\...\gen\bcm\aes-gcm-avx2-x86_64-win.asm'
+> ```
+>
+> 所以 `build.ps1` 在检测到项目路径含非 ASCII 字符时，会自动建一个**固定名字**的
+> 目录联接 `C:\sentinel-rs-ascii` → 当前项目的父目录，然后从联接路径跑 cargo。
+> 物理产物仍在**本项目的 `target\release\`**（联接只是路径别名，不是另一份拷贝）。
+>
+> - 联接名可用 `SENTINEL_ASCII_ROOT` 覆盖；
+> - 脚本每次都校验联接指向**当前**项目父目录，指向旧路径会自动拆掉重建；
+> - 项目路径本身是纯 ASCII 时不需要联接，脚本会跳过这一步；
+> - 资源文件（`tests/token_expected.json`、`sample_challenge.json`）由二进制在
+>   **运行期**定位（`SENTINEL_REPO_ROOT` → `CARGO_MANIFEST_DIR` → cwd → exe 上级），
+>   所以搬目录 / 换联接都不影响已编译好的 `token_check.exe` / `so_check.exe`。
 
 ```powershell
 # 构建（唯一受支持的入口）
@@ -58,8 +80,9 @@ OpenAI 注册链路中 **Sentinel token** 的 Rust 重实现，加上一套可�
 ```
 
 依赖版本是钉死的：`wreq = "=0.16.1"` + `wreq-util = "=0.2.0"`（`wreq` 6.x / `wreq-util` 3.x 的组合目前编不过）。
-默认 TLS emulation 是 `wreq_util::Emulation::Chrome149`，可用 `TURB_WREQ_EMULATION` 覆盖
-（`Chrome149` / `Chrome146` / `Firefox148` …，大小写与 `_`/`-` 不敏感）：
+默认 TLS emulation 是 `wreq_util::Emulation::Chrome146`，可用 `TURB_WREQ_EMULATION` 覆盖
+（`Chrome140` / `Chrome145` / `Chrome146` / `Chrome149` / `Firefox148` …，大小写与 `_`/`-` 不敏感）。
+设备指纹路径会自己按指纹的 `impersonate` 选档（`Chrome140/145/146/149`），不受这个默认值影响：
 
 ```powershell
 $env:TURB_WREQ_EMULATION = "Chrome146"
@@ -81,21 +104,31 @@ $env:TURB_WREQ_EMULATION = "Chrome146"
 | --- | --- | --- |
 | `SENTINEL_LIVE_REGISTER` | `1` 才真的联网注册 | `0`（dry-run） |
 | `SENTINEL_COUNT` / `REGISTER_COUNT` | 批量数量 | `1` |
-| `SENTINEL_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` | 代理（`host:port` 或 `scheme://[user:pass@]host:port`） | 直连 |
-| `REG_MAIL_API_BASE_URL` | 邮箱取码 API 基地址（必填，`https://`） | 无 → 不能 `--live` |
+| `SENTINEL_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` | 单个代理（`host:port` 或 `scheme://[user:pass@]host:port`），**优先于代理清单** | 直连 |
+| `SENTINEL_PROXY_FILE` | 代理清单文件，每行 `host:port:user:pass`，第 N 个账号用第 N % 条数 条 | 无 |
+| `REG_MAIL_EMAIL_FILE` | 静态邮箱池（每行 `email----code_url`），**优先于** `REG_MAIL_API_*` | 无 |
+| `REG_MAIL_API_BASE_URL` | 邮箱取码 API 基地址（默认 `https://`） | 无 → 不能 `--live` |
 | `REG_MAIL_API_TOKEN` | 邮箱 API bearer token（可选） | 空 → 不发鉴权头 |
-| `REG_MAIL_ALLOW_INSECURE` | `1` 放行回环 `http://`（本地自建 / mock） | `0` |
+| `REG_MAIL_ALLOW_INSECURE` | `1` 放行**任意 host** 的明文 `http://`（`code_url` / `base_url` 共用；开启后打印一次明文告警） | `0`（明文 http 一律拒绝） |
 | `SENTINEL_ENABLE_2FA` | 注册后 enroll + activate TOTP | `0` |
 | `OTP_MAX_WAIT` / `OTP_POLL_INTERVAL` | 取码等待上限 / 轮询间隔（秒） | `180` / `3` |
 | `SENTINEL_DB_PATH` | SQLite 路径 | `data/sentinel-rs.db` |
 | `SENTINEL_USER_AGENT` / `SENTINEL_ACCEPT_LANGUAGE` | 显式指定 UA / 语言；**给定时不做随机指纹** | 每次注册随机生成（见下节） |
 | `SENTINEL_FP_SEED` | 设备指纹随机种子；给定则确定性生成 | 空 → 系统随机 |
-| `SENTINEL_FP_COUNTRY` | 强制指纹区域（`JP` / `GB` / `DE` …） | 空 → 全表随机 |
+| `SENTINEL_FP_COUNTRY` | 强制指纹区域（`JP` / `GB` / `DE` …，共 50 个） | 空 → 探测出口国家；失败才 `UTC` + `en-US,en` |
+| `SENTINEL_FP_GEO_PROBE` | `0`/`false`/`off`/`no` 关闭「出口 IP 国家 → 指纹国家」探测 | `1`（开启） |
 | `SENTINEL_LOG` | `trace` / `debug` / `info` / `warn` / `error` / `off` | `info` |
 
 ### 代理
 
 `--proxy` 或 `SENTINEL_PROXY`；支持 `socks5h://host:port`、`http://user:pass@host:port`。
+
+**代理清单 + 轮换**：`--proxy-file PATH` / `SENTINEL_PROXY_FILE`，每行 代理服务商 风格的
+`host:port:user:pass`（也接受 `host:port` 与完整 URL），自动规范成
+`http://user:pass@host:port`（userinfo 里的特殊字符会 percent-encode）。第 N 个账号用第
+`N % len` 条 —— 纯取模，天然并发安全。`--proxy` 仍然优先，用来做"本地 10808 → 上游动态"
+的链式场景。
+
 需要**真浏览器级 TLS 指纹**，所以不要指望直连能稳定过 Cloudflare。
 
 ### 一次性看链路（不消耗邮箱）
@@ -123,24 +156,39 @@ $env:OTP_MAX_WAIT="120"; $env:OTP_POLL_INTERVAL="3"
 `DeviceFingerprint` 派生，所以 HTTP 头、sentinel token 里的 `profile` 块、
 TLS/HTTP2 emulation 三处永远一致：
 
+规则与 Python 协议机（真机对齐版）`协议/fingerprint.py` 逐条一致：**只有 Chrome on
+Windows 一条路径**（真机不存在 Chrome + MacIntel，Python 的 `validate_fingerprint`
+会直接抛异常）。版本上守一条硬规则：**TLS 档位必须等于声称的版本** —— wreq-util 最高
+只到 `Chrome149`，所以四个档各自配同版本的 UA / `sec-ch-ua` / full-version-list
+（旧版统一声称 152、握手却是 149，ja4 一比就穿帮）。
+
 | 维度 | 规则 |
 | --- | --- |
-| 浏览器版本 | 只从 `145.0.0.0` / `146.0.0.0` / `149.0.0.0` 里选，且 `emulation` 必须是同档位（`Chrome145/146/149`）；UA 与 `sec-ch-ua` 的版本号必须一致 |
-| 平台 | 二选一：Windows（`Windows NT 10.0; Win64; x64` / `"Windows"` / `Win32`）或 macOS（`Macintosh; Intel Mac OS X 10_15_7` / `"macOS"` / `MacIntel`） |
-| 时区 ↔ 语言 | 只从同一行区域画像里取，绝不交叉组合（`Asia/Tokyo→ja-JP`、`Asia/Shanghai→zh-CN`、`America/New_York→en-US`、`Europe/London→en-GB`、`Europe/Berlin→de-DE`、`Asia/Singapore→en-SG`、`Australia/Sydney→en-AU` …） |
-| 屏幕 / dpr | 平台各自的常见组合（`1366x768` … `3840x2160`），`screen_height >= 700`，dpr ∈ {1.0, 1.25, 1.5, 2.0} 且与屏幕匹配 |
-| 硬件 | `hardware_concurrency ∈ {4,8,12,16}`、`device_memory ∈ {4,8,16}` |
-| fingerprint_id | `fp_` + 16 位 base62，完全本地派生，不依赖任何外部指纹服务 |
+| 平台 | 恒 Windows：`(Windows NT 10.0; Win64; x64)` / `sec-ch-ua-platform: "Windows"` / `navigator.platform=Win32` / `vendor=Google Inc.` |
+| UA 版本 | 与 TLS 档同档：`Chrome/140.0.0.0` / `145.0.0.0` / `146.0.0.0` / `149.0.0.0` |
+| `sec-ch-ua` | 同一档派生：`"Chromium";v="<major>", "Not?A_Brand";v="24", "Google Chrome";v="<major>"` |
+| 高熵真值 | `ua_full_version_list`（同档真实构建号 `140.0.7339.207` / `145.0.7632.160` / `146.0.7680.178` / `149.0.7778.180`）、`ua_arch=x86`、`ua_bitness=64`、`ua_model=""`、`ua_platform_version=15.0.0` |
+| TLS 档位 | `Chrome140/145/146/149` 加权 10/35/35/20 —— **每档与 UA / `sec-ch-ua` / full-version-list 同版本**（`DeviceFingerprint::version_consistency()` 守住这条不变量） |
+| 时区 ↔ 语言 | 50 个国家画像（照抄 Python `_COUNTRY_PROFILES`），时区按权重抽；语言取 3~5 个、主语言固定首位、`q=0.9/0.8/…` 递减，`locale == lang` |
+| 屏幕 | 11 档加权：`1920x1080`(30) `1366x768`(12) `1536x864`(10) `2560x1440`(10) `1600x900`(8) `1440x900`(6) `1920x1200`(4) `1680x1050`(3) `3840x2160`(3) `1280x1024`(2) `2560x1600`(2) |
+| dpr | 5 档加权、**独立**抽：1.0(30) / 1.25(25) / 1.5(25) / 1.75(10) / 2.0(10) |
+| 硬件 | `hardware_concurrency` 9 档加权（4/6/8/10/12/14/16/20/24）、`device_memory ∈ {2,4,8}` 加权（spec 封顶 8） |
+| 触摸 | `max_touch_points=0`、`is_mobile=false`、`has_touch=false` |
+| viewport | 与 `screen` 完全相同（真机 `window.innerWidth/Height` 不会比屏幕小） |
+| fingerprint_id | `fp_` + `secrets.token_urlsafe(12)` 形态（12 字节 urlsafe base64 = 16 字符） |
 
-`accept-language` 由主语言派生：`ja-JP` → `ja-JP,ja;q=0.9,en;q=0.8`，英语系则是
-`en-US,en;q=0.9`。
+组合空间 = 11 × 5 × 9 × 3 × 4 = **5940** 种设备组合（[`fingerprint::DEVICE_COMBINATIONS`]），
+叠加 50 国语言排列后更大。加权抽样走同一个随机源，`SENTINEL_FP_SEED` 给定即完全可复现。
+
+`accept-language` 由语言池派生（主语言不带 q）：`ja-JP` → `ja-JP,zh-CN;q=0.9,en;q=0.8`。
 
 ### 三个环境变量
 
 | 变量 | 作用 |
 | --- | --- |
 | `SENTINEL_FP_SEED` | 给定则**确定性生成**：同 seed 得到完全相同的一套指纹（含 `fingerprint_id`），方便复现线上画像 / 回归测试 |
-| `SENTINEL_FP_COUNTRY` | 强制区域，如 `JP`（大小写不敏感）。时区、语言、屏幕倾向都跟着该区域走；未知国家回退到全量随机 |
+| `SENTINEL_FP_COUNTRY` | 强制区域，如 `JP`（大小写不敏感，共 50 国）。时区按该画像的权重抽、语言池取该画像；未知/留空回退 `_DEFAULT_COUNTRY_PROFILE`（`UTC` + `en-US,en`，与 Python 一致） |
+| `SENTINEL_FP_GEO_PROBE` | 出口国家探测开关。默认**开启**：先用 `GET https://cloudflare.com/cdn-cgi/trace` 探 `loc=XX`（10s 超时、best-effort，失败不影响注册），再按该国画像生成指纹 —— 与 Python `auth_flow.py::_probe_country_before_fingerprint` 同一套逻辑。置 `0` 关闭（离线 / 单测） |
 | `SENTINEL_USER_AGENT` / `SENTINEL_ACCEPT_LANGUAGE` | 显式覆盖：**此时完全不随机**，UA / 语言按你给的值走（旧行为）；`SENTINEL_ACCEPT_LANGUAGE` 单独设置同样会关掉随机 |
 
 ```powershell
@@ -154,22 +202,57 @@ $env:SENTINEL_FP_COUNTRY="JP"; .\target\release\sentinel-rs.exe register -n 1
 ```
 
 `register` 的配置打印里有一行「指纹」，格式是
-`<版本> / <平台> / <时区> / <屏幕>/<dpr> / fp=<id>`；真实注册时日志还会打出
-`[fp] … ua=<本次实际使用的 UA>`，可以直接对照。多账号（`-n > 1`）**每个账号各生成一套**，
-配置打印那一行显示的是"每账号独立生成"。
+`<版本>(tls=<档位>) / <平台> / <时区> / <屏幕>/<dpr> / <语言> / <核数>c/<内存>g / fp=<id>`；
+真实注册时日志还会打出 `[fp] … ua=<UA> ch=<sec-ch-ua> lang=<accept-language>`，可以直接对照。
+多账号（`-n > 1`）**每个账号各生成一套**，配置打印那一行显示的是"每账号独立生成"。
+
+## 邮箱：静态池（固定邮箱 + 取码链接）
+
+`--email-file PATH` / `REG_MAIL_EMAIL_FILE` 指向一个清单，**只支持**每行：
+
+```
+some-mailbox@icloud.com----https://mail.example/share/v1/code?link=…&token=…
+some-mailbox@icloud.com----http://mail.example.com:8080/api/plus/v4/getcode?id=some-mailbox@icloud.com
+```
+
+* 分隔符固定 4 个连字符；空行 / `#` 注释行忽略。
+* 格式不对的行**明确告警并跳过**（日志带行号 + 原因），不会静默忽略、也不会整批中止。
+* `code_url` 允许 `http://IP:PORT/…?query`，但**必须**同时设置
+  `REG_MAIL_ALLOW_INSECURE=1`（放行任意 host 的明文 http，进程内只打印一次
+  `邮箱取码走明文 http（<host>），仅限可信内网/自建服务`）；未开启时明文 http 行按
+  "格式不对"跳过（默认安全）。
+* 首行 UTF-8 BOM 会被自动剥掉（记事本 / Excel 导出的清单常见）。
+
+设置后**不调用** `POST /mailboxes`：按顺序取一行，取码仍走 `GET {code_url}`（JSON
+`{"code":"123456",…}` 与 HTML 卡片两种形态都认；`{"code":"no_code","success":false,…}`
+视为"还没有码"，继续轮询）。已用过的邮箱追加进 `<email-file>.used`（一行一个，按
+**清单文件路径**区分，多清单互不污染），下次启动自动跳过，避免重跑撞 `409 user_exists`；
+进程内互斥 + `<email-file>.lock` 文件锁保证**同一行不会被两个任务同时取走**。
+静态池与 `REG_MAIL_API_*` 互斥，静态池优先。
+
+```powershell
+$env:REG_MAIL_ALLOW_INSECURE = "1"          # code_url 是明文 http://IP:PORT 时必需
+$env:REG_MAIL_EMAIL_FILE     = "C:\path\mails.txt"
+$env:SENTINEL_LIVE_REGISTER  = "1"
+
+# 只解析不注册：打印前 3 条 + 总行数 + 跳过行数（不写 .used）
+.\target\release\sentinel-rs.exe email-pool --file $env:REG_MAIL_EMAIL_FILE --limit 3
+
+.\target\release\sentinel-rs.exe register -n 1 --live
+```
 
 ## 邮箱 API 契约
 
-邮箱层只认下面这一个 HTTP 契约，服务端可以是任何实现（自建服务、云函数、现成临时邮箱服务的包装）。
-`src/flow/email.rs` 是唯一实现，没有其它邮箱凭据来源。
+邮箱层只认下面这一个 HTTP 契约（不设 `REG_MAIL_EMAIL_FILE` 时使用），服务端可以是任何实现
+（自建服务、云函数、现成临时邮箱服务的包装）。`src/flow/email.rs` 是唯一实现，没有其它邮箱凭据来源。
 
 ### 环境变量
 
 | 变量 | 必需 | 说明 |
 | --- | --- | --- |
-| `REG_MAIL_API_BASE_URL` | ✅ | 基地址，**必须 `https://`**。本地自建 / mock 用 `http://127.0.0.1:PORT/...` 时必须同时设置 `REG_MAIL_ALLOW_INSECURE=1`（只放行回环地址，其它 `http://` 一律拒绝） |
+| `REG_MAIL_API_BASE_URL` | ✅ | 基地址，**默认必须 `https://`**。明文 `http://`（含自建 `http://IP:PORT/...`）必须同时设置 `REG_MAIL_ALLOW_INSECURE=1`，否则拒绝 |
 | `REG_MAIL_API_TOKEN` | 否 | 非空时每个请求带 `Authorization: Bearer <token>`；留空则不发鉴权头 |
-| `REG_MAIL_ALLOW_INSECURE` | 否 | `1`/`true`/`yes`/`on` 才放行回环 `http://`（本地 mock 的逃生门） |
+| `REG_MAIL_ALLOW_INSECURE` | 否 | `1`/`true`/`yes`/`on` 时放行**任意 host** 的明文 `http://`（`code_url` 与 `base_url` 共用；仅限可信内网/自建服务，开启后进程内打印一次明文告警） |
 
 ### 端点
 
@@ -185,12 +268,12 @@ Content-Type: application/json
 ```
 
 - `email` 必须含 `@`；
-- `code_url` 必须是 `https://`（`REG_MAIL_ALLOW_INSECURE=1` 时也接受回环 `http://`）；
+- `code_url` 默认必须是 `https://`；明文 `http://` 仅在 `REG_MAIL_ALLOW_INSECURE=1` 时接受；
 - 其它状态码按失败处理，响应体里的 `error` 字段会进日志（截断 200 字符）。
 
 **2）取验证码 —— `GET {code_url}`**
 
-返回 `text/html` 取码页，**最新在前**，每封邮件一张卡片：
+返回 `text/html`（或 `application/json`，见下）取码页，**最新在前**，每封邮件一张卡片：
 
 ```html
 <article>

@@ -3,12 +3,20 @@ use sentinel_rs::token::{self, Rng};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let path = args
-        .get(1)
-        .cloned()
-        .unwrap_or_else(|| "sample_challenge.json".into());
+    let path_arg = args.get(1).cloned();
+    let path = sentinel_rs::paths::resolve_optional(
+        path_arg.as_deref(),
+        "sample_challenge.json",
+    )
+    .unwrap_or_else(|err| {
+        eprintln!("[profile_mint] {err}");
+        std::process::exit(1);
+    });
     let want_so = args.iter().any(|a| a == "--so");
-    let text = std::fs::read_to_string(&path).expect("read challenge");
+    let text = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+        eprintln!("[profile_mint] 读不到 {}: {e}", path.display());
+        std::process::exit(1);
+    });
     let blob: serde_json::Value = serde_json::from_str(&text).expect("parse json");
     let p = blob
         .get("p")

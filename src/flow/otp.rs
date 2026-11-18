@@ -287,3 +287,180 @@ fn civil_to_unix(year: i64, month: i64, day: i64, hour: i64, minute: i64, second
     let days = era * 146_097 + doe - 719_468;
     days * 86_400 + hour * 3_600 + minute * 60 + second
 }
+
+// ─────────────────────── JSON 取码页（固定邮箱服务常见形态）───────────────────────
+
+/// 正文看起来像 JSON（对象 / 数组），供日志与分支判断。
+pub fn looks_like_json(body: &str) -> bool {
+    let trimmed = body.trim_start();
+    trimmed.starts_with('{') || trimmed.starts_with('[')
+}
+
+/// "还没有验证码"的占位标记（`{"code":"no_code",...}` 这类）。
+const PENDING_MARKERS: &[&str] = &[
+    "no_code",
+    "nocode",
+    "no-code",
+    "none",
+    "null",
+    "pending",
+    "empty",
+    "waiting",
+    "not_found",
+    "notfound",
+];
+
+/// 该 `code` 字段值是否是"还没有码"的占位符。
+fn is_pending_marker(raw: &str) -> bool {
+    let trimmed = raw.trim();
+    trimmed.is_empty()
+        || PENDING_MARKERS
+            .iter()
+            .any(|m| trimmed.eq_ignore_ascii_case(m))
+}
+
+/// JSON 是否明确表示"还没有验证码"；是则返回原因（日志用）。
+///
+/// 认这三种形态：
+///   * `{"success": false, ...}` / `{"ok": false, ...}`
+///   * `{"code": "no_code", ...}`（占位符，不是 6 位数字）
+///   * 既没有 `code` 也没有 `otp` 等字段的 JSON（纯状态页）
+///
+/// 返回 `None` 表示"不是待机响应"（有码 / 不是 JSON）。
+pub fn json_pending_reason(body: &str) -> Option<String> {
+    if !looks_like_json(body) {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_str(body).ok()?;
+    pending_reason(&value)
+}
+
+fn pending_reason(value: &serde_json::Value) -> Option<String> {
+    let serde_json::Value::Object(map) = value else {
+        return None;
+    };
+    if map.get("success").and_then(serde_json::Value::as_bool) == Some(false) {
+        return Some("success=false".to_string());
+    }
+    if map.get("ok").and_then(serde_json::Value::as_bool) == Some(false) {
+        return Some("ok=false".to_string());
+    }
+    match map.get("code") {
+        Some(serde_json::Value::String(raw)) if is_pending_marker(raw) => {
+            return Some(format!("code={raw:?}"));
+        }
+        Some(serde_json::Value::Null) => return Some("code=null".to_string()),
+        _ => {}
+    }
+    // 完全没有码字段的 JSON（例如 `{"message":"暂未收到验证码","retryable":true}`）
+    let mut code = None;
+    let mut received_at = None;
+    collect_code_fields(value, &mut code, &mut received_at, 0);
+    if code.is_none() {
+        let retryable = map
+            .get("retryable")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        return Some(if retryable {
+            "无 code 字段（retryable=true）".to_string()
+        } else {
+            "无 code 字段".to_string()
+        });
+    }
+    None
+}
+
+/// 从**JSON** 取码页里取验证码（`{"ok":true,"code":"746194","received_at":1794929150}`）。
+///
+/// 固定邮箱服务（每行 `email----code_url` 那种）常把取码链接做成 JSON API 而不是
+/// HTML 卡片页，所以取码必须先认 JSON、再退回 HTML 卡片解析（行为不变）。
+///
+/// **待机响应不算码**（返回 `None`，调用方继续轮询，不报错）：
+///   * `success=false` / `ok=false`
+///   * `code` 不是 6 位数字（典型：`"no_code"`、`null`、`""`）
+///   * JSON 里根本没有码字段
+///
+/// 嵌套形态（`data.code` / `result.code` / `data.otp`）递归查找。
+///
+/// 新鲜度：
+///   * 有 `received_at`（unix 秒）→ `received_at >= after_ts - 5` 即认为新鲜
+///     （对齐 HTML 卡片路径的 5 秒容差）；
+///   * 没有时间戳 → 只要不在 `baseline` 里就算新鲜。
+pub fn select_code_from_json(
+    body: &str,
+    after_ts: Option<i64>,
+    baseline: &HashSet<String>,
+) -> Option<String> {
+    if !looks_like_json(body) {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_str(body).ok()?;
+    // 待机响应（`success=false` / `code="no_code"`）一律当"还没有码"。
+    if pending_reason(&value).is_some() {
+        return None;
+    }
+
+    let mut code: Option<String> = None;
+    let mut received_at: Option<i64> = None;
+    collect_code_fields(&value, &mut code, &mut received_at, 0);
+
+    let code = code?;
+    if baseline.contains(&code) {
+        return None;
+    }
+    match (received_at, after_ts) {
+        (Some(ts), Some(after)) => (ts >= after - 5).then_some(code),
+        _ => Some(code),
+    }
+}
+
+/// 在 JSON 里递归找验证码字段与时间戳字段（深度受限，避免病态输入）。
+fn collect_code_fields(
+    value: &serde_json::Value,
+    code: &mut Option<String>,
+    received_at: &mut Option<i64>,
+    depth: usize,
+) {
+    const CODE_KEYS: &[&str] = &[
+        "code",
+        "otp",
+        "verification_code",
+        "verificationcode",
+        "verify_code",
+    ];
+    const TS_KEYS: &[&str] = &["received_at", "receivedat", "timestamp", "ts", "time"];
+
+    if depth > 6 || value.is_null() {
+        return;
+    }
+    match value {
+        serde_json::Value::Object(map) => {
+            for (key, item) in map {
+                let key_lower = key.to_ascii_lowercase();
+                if code.is_none() && CODE_KEYS.contains(&key_lower.as_str()) {
+                    let raw = match item {
+                        serde_json::Value::String(s) => s.clone(),
+                        serde_json::Value::Number(n) => n.to_string(),
+                        _ => String::new(),
+                    };
+                    if let Some(found) = extract_otp(&raw) {
+                        *code = Some(found);
+                    }
+                }
+                if received_at.is_none() && TS_KEYS.contains(&key_lower.as_str()) {
+                    if let Some(ts) = item.as_i64() {
+                        // 毫秒时间戳顺手归一成秒
+                        *received_at = Some(if ts > 1_000_000_000_000 { ts / 1000 } else { ts });
+                    }
+                }
+                collect_code_fields(item, code, received_at, depth + 1);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                collect_code_fields(item, code, received_at, depth + 1);
+            }
+        }
+        _ => {}
+    }
+}

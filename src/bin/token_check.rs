@@ -4,8 +4,6 @@
 //! 运行：`cargo run --release --bin token_check`
 //! 输出末行 `equal=True` 表示完全一致；不一致时打印差异并 `equal=False`（退出码 1）。
 
-use std::path::{Path, PathBuf};
-
 use serde_json::Value;
 
 use sentinel_rs::token::{
@@ -100,6 +98,14 @@ fn options_from(meta: &Value) -> ProfileOptions {
         device_memory: o.get("device_memory").and_then(|v| v.as_i64()),
         device_pixel_ratio: o.get("device_pixel_ratio").and_then(|v| v.as_f64()),
         timezone: s("timezone"),
+        // 高熵 client hints / 触摸 / 移动标记：期望文件里没有对应 key 时保持默认，
+        // 这样 token 对拍仍然逐字节一致（Python `_profile()` 也不产出这些字段）。
+        ua_brands: None,
+        ua_platform_version: s("ua_platform_version"),
+        ua_arch: s("ua_arch"),
+        ua_bitness: s("ua_bitness"),
+        max_touch_points: o.get("max_touch_points").and_then(|v| v.as_i64()),
+        is_mobile: o.get("is_mobile").and_then(|v| v.as_bool()),
     }
 }
 
@@ -238,24 +244,79 @@ fn check_config(chk: &mut Checker, tag: &str, cfg: &Config, want: &Value) {
 }
 
 fn main() {
-    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let expected_path = manifest.join("tests").join("token_expected.json");
-    let sample_path = manifest.join("sample_challenge.json");
+    // 运行期定位资源（**不要**用 env!("CARGO_MANIFEST_DIR") —— 那是编译期，
+    // 项目一旦搬家 / 经 ASCII 联接构建，二进制就再也找不到文件）。
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    let mut expected_arg: Option<String> = None;
+    let mut challenge_arg: Option<String> = None;
+    let mut i = 0usize;
+    while i < argv.len() {
+        match argv[i].as_str() {
+            "--expected" => {
+                expected_arg = argv.get(i + 1).cloned();
+                i += 2;
+            }
+            "--challenge" => {
+                challenge_arg = argv.get(i + 1).cloned();
+                i += 2;
+            }
+            "-h" | "--help" => {
+                println!(
+                    "用法: token_check [--expected PATH] [--challenge PATH]\n\
+                     默认在仓库根（可用 SENTINEL_REPO_ROOT 指定）运行期查找 \
+                     tests/token_expected.json 与 sample_challenge.json"
+                );
+                return;
+            }
+            other => {
+                eprintln!("[token_check] 未识别的参数: {other:?}（可用 --expected / --challenge）");
+                std::process::exit(2);
+            }
+        }
+    }
+
+    let expected_path = match sentinel_rs::paths::resolve_optional(
+        expected_arg.as_deref(),
+        "tests/token_expected.json",
+    ) {
+        Ok(path) => path,
+        Err(err) => {
+            eprintln!("[token_check] {err}");
+            eprintln!("提示：先运行 `python tools/token_parity.py` 生成 tests/token_expected.json");
+            std::process::exit(1);
+        }
+    };
+    let sample_path =
+        match sentinel_rs::paths::resolve_optional(challenge_arg.as_deref(), "sample_challenge.json") {
+            Ok(path) => path,
+            Err(err) => {
+                eprintln!("[token_check] {err}");
+                std::process::exit(1);
+            }
+        };
 
     println!("== sentinel-rs token parity check ==");
     println!("expected : {}", expected_path.display());
     println!("challenge: {}", sample_path.display());
 
-    let expected_text = std::fs::read_to_string(&expected_path).unwrap_or_else(|e| {
-        panic!(
-            "读不到 {}: {}（先运行 python tools/token_parity.py）",
-            expected_path.display(),
-            e
-        )
-    });
+    let expected_text = match std::fs::read_to_string(&expected_path) {
+        Ok(text) => text,
+        Err(e) => {
+            eprintln!(
+                "[token_check] 读不到 {}: {e}（先运行 python tools/token_parity.py）",
+                expected_path.display()
+            );
+            std::process::exit(1);
+        }
+    };
     let expected: Value = serde_json::from_str(&expected_text).expect("parse expected json");
-    let sample_text =
-        std::fs::read_to_string(&sample_path).unwrap_or_else(|e| panic!("读不到 challenge: {}", e));
+    let sample_text = match std::fs::read_to_string(&sample_path) {
+        Ok(text) => text,
+        Err(e) => {
+            eprintln!("[token_check] 读不到 challenge {}: {e}", sample_path.display());
+            std::process::exit(1);
+        }
+    };
     let sample: Value = serde_json::from_str(&sample_text).expect("parse sample challenge");
 
     let meta = &expected["meta"];
@@ -465,5 +526,3 @@ fn decode_b64(s: &str) -> String {
     String::from_utf8(bytes).expect("base64 内容不是 UTF-8")
 }
 
-#[allow(dead_code)]
-fn unused(_p: &Path) {}
