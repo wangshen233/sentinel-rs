@@ -123,7 +123,7 @@ $env:TURB_WREQ_EMULATION = "Chrome146"
 
 `--proxy` 或 `SENTINEL_PROXY`；支持 `socks5h://host:port`、`http://user:pass@host:port`。
 
-**代理清单 + 轮换**：`--proxy-file PATH` / `SENTINEL_PROXY_FILE`，每行 代理服务商 风格的
+**代理清单 + 轮换**：`--proxy-file PATH` / `SENTINEL_PROXY_FILE`，每行
 `host:port:user:pass`（也接受 `host:port` 与完整 URL），自动规范成
 `http://user:pass@host:port`（userinfo 里的特殊字符会 percent-encode）。第 N 个账号用第
 `N % len` 条 —— 纯取模，天然并发安全。`--proxy` 仍然优先，用来做"本地 10808 → 上游动态"
@@ -211,8 +211,8 @@ $env:SENTINEL_FP_COUNTRY="JP"; .\target\release\sentinel-rs.exe register -n 1
 `--email-file PATH` / `REG_MAIL_EMAIL_FILE` 指向一个清单，**只支持**每行：
 
 ```
-some-mailbox@icloud.com----https://mail.example/share/v1/code?link=…&token=…
-some-mailbox@icloud.com----http://mail.example.com:8080/api/plus/v4/getcode?id=some-mailbox@icloud.com
+some-mailbox@example.com----https://mail.example.com/share/v1/code?link=…&token=…
+some-mailbox@example.com----http://mail.example.com:8080/api/plus/v4/getcode?id=some-mailbox@example.com
 ```
 
 * 分隔符固定 4 个连字符；空行 / `#` 注释行忽略。

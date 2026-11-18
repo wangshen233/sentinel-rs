@@ -344,7 +344,7 @@ pub fn normalize_proxy_url(raw: &str) -> Result<String> {
     Ok(with_scheme)
 }
 
-/// 代理清单的环境变量名（每行 `host:port:user:pass`，代理服务商 风格）。
+/// 代理清单的环境变量名（每行 `host:port:user:pass`）。
 pub const ENV_PROXY_FILE: &str = "SENTINEL_PROXY_FILE";
 
 /// 代理清单：每行 `host:port:user:pass`，按账号下标轮换。

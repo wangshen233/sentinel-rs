@@ -7,7 +7,7 @@
 //! 经 ASCII 联接构建，见 README 的 nasm 说明），二进制就再也找不到资源：
 //!
 //! ```text
-//! 读不到 <build-path>\sentinel-rs-main\tests\token_expected.json:
+//! 读不到 <构建时的 ASCII 联接路径>\tests\token_expected.json:
 //! 系统找不到指定的路径。 (os error 3)
 //! ```
 //!

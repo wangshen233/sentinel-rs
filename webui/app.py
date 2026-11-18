@@ -65,10 +65,11 @@ DEFAULT_SOCKS = "127.0.0.1:10808"
 DEFAULT_CONFIG = {
     "count": 1,
     "concurrency": 1,
-    "email_file": r"C:\Users\<user>\Downloads\mailboxes.txt",
+    # 留空：由用户在界面里填。不预置任何个人路径 / 清单文件名。
+    "email_file": "",
     "proxy_mode": "none",          # none | single | file
     "proxy": "",
-    "proxy_file": r"C:\Users\<user>\Downloads\proxies.txt",
+    "proxy_file": "",
     "mail_allow_insecure": False,  # REG_MAIL_ALLOW_INSECURE=1
     "enable_2fa": False,           # SENTINEL_ENABLE_2FA
     "otp_max_wait": 600,           # OTP_MAX_WAIT

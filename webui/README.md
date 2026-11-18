@@ -14,7 +14,7 @@ webui/
 ## 快速开始
 
 ```bat
-cd /d "C:\Users\<user>\Desktop\新建文件夹 (4)\sentinel-rs-main"
+cd /d "<仓库根目录>"
 python webui\app.py                :: 默认 127.0.0.1:8787，自动开浏览器
 python webui\app.py --port 9000    :: 换端口
 python webui\app.py --no-browser   :: 不自动开浏览器（自己点控制台里的地址）

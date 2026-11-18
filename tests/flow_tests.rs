@@ -371,7 +371,7 @@ fn email_allows_insecure_only_with_opt_in() {
     assert!(email::is_loopback_url("http://[::1]:8899/x"));
     assert!(!email::is_loopback_url("http://mail.example.invalid/x"));
     assert_eq!(
-        email::url_host("http://mail.example.com:8080/api/x?id=a@b").as_deref(),
+        email::url_host("http://203.0.113.7:8080/api/x?id=a@b").as_deref(),
         Some("203.0.113.7")
     );
 }
@@ -955,8 +955,8 @@ fn static_email_pool_never_hands_out_the_same_line_twice() {
 }
 
 #[test]
-fn proxy_pool_parses_proxy_lines_and_rotates() {
-    // 代理服务商 风格：host:port:user:pass
+fn proxy_pool_parses_host_port_user_pass_and_rotates() {
+    // 代理清单风格：host:port:user:pass
     let url = http::ProxyPool::parse_line("proxy.example.com:8080:user-abc:pass-word")
         .unwrap()
         .expect("应解析出一行");
